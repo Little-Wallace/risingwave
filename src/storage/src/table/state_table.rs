@@ -226,10 +226,6 @@ impl<S: StateStore> StateTable<S> {
             .await
     }
 
-    pub fn pk_indices(&self) -> &[usize] {
-        &self._pk_indices
-    }
-
     pub fn is_dirty(&self) -> bool {
         !self.mem_table.buffer.is_empty()
     }
