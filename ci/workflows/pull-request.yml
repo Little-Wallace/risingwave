@@ -8,10 +8,10 @@ cargo-cache: &cargo-cache
   s3:
     bucket: ci-cache-bucket
   paths:
-    - "~/.cargo/bin/"
-    - "~/.cargo/registry/index/"
-    - "~/.cargo/registry/cache/"
-    - "~/.cargo/git/db/"
+    - "~/.cargo/bin"
+    - "~/.cargo/registry/index"
+    - "~/.cargo/registry/cache"
+    - "~/.cargo/git/db"
 
 steps:
   - label: "build"
