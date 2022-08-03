@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use std::ops::DerefMut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use risingwave_hummock_sdk::{HummockSstableId, SstIdRange};
@@ -27,6 +28,7 @@ pub type SstableIdManagerRef = Arc<SstableIdManager>;
 /// 2. TODO #4037: Maintains watermark SST ids. It will be used by SST full GC.
 pub struct SstableIdManager {
     available_sst_ids: Mutex<SstIdRange>,
+    pending_fetch_id: AtomicBool,
     remote_fetch_number: u32,
     hummock_meta_client: Arc<dyn HummockMetaClient>,
 }
@@ -40,6 +42,7 @@ impl SstableIdManager {
             )),
             remote_fetch_number,
             hummock_meta_client,
+            pending_fetch_id: AtomicBool::new(true),
         }
     }
 
@@ -47,22 +50,42 @@ impl SstableIdManager {
         let mut guard = self.available_sst_ids.lock().await;
         let available_sst_ids = guard.deref_mut();
         if available_sst_ids.peek_next_sst_id().is_none() {
-            let new_sst_ids = self
-                .hummock_meta_client
-                .get_new_sst_ids(self.remote_fetch_number)
-                .await
-                .map_err(HummockError::meta_error)?;
-
-            if new_sst_ids.start_id < available_sst_ids.end_id {
-                return Err(HummockError::meta_error(format!(
-                    "SST id moves backwards. new {} < old {}",
-                    new_sst_ids.start_id, available_sst_ids.end_id
-                )));
+            drop(available_sst_ids);
+            drop(guard);
+            if self.pending_fetch_id.load(Ordering::Acquire) {
+                let new_sst_ids = self
+                    .hummock_meta_client
+                    .get_new_sst_ids(1)
+                    .await
+                    .map_err(HummockError::meta_error)?;
+                new_sst_ids.peek_next_sst_id().ok_or_else(|| {
+                    HummockError::meta_error("get_new_sst_ids RPC returns empty result")
+                })
+            } else {
+                self.pending_fetch_id.store(true, Ordering::Release);
+                let new_sst_ids = self
+                    .hummock_meta_client
+                    .get_new_sst_ids(self.remote_fetch_number)
+                    .await
+                    .map_err(HummockError::meta_error)?;
+                let mut guard = self.available_sst_ids.lock().await;
+                let available_sst_ids = guard.deref_mut();
+                if new_sst_ids.start_id < available_sst_ids.end_id {
+                    return Err(HummockError::meta_error(format!(
+                        "SST id moves backwards. new {} < old {}",
+                        new_sst_ids.start_id, available_sst_ids.end_id
+                    )));
+                }
+                *available_sst_ids = new_sst_ids;
+                self.pending_fetch_id.store(false, Ordering::Release);
+                available_sst_ids.get_next_sst_id().ok_or_else(|| {
+                    HummockError::meta_error("get_new_sst_ids RPC returns empty result")
+                })
             }
-            *available_sst_ids = new_sst_ids;
+        } else {
+            available_sst_ids
+                .get_next_sst_id()
+                .ok_or_else(|| HummockError::meta_error("get_new_sst_ids RPC returns empty result"))
         }
-        available_sst_ids
-            .get_next_sst_id()
-            .ok_or_else(|| HummockError::meta_error("get_new_sst_ids RPC returns empty result"))
     }
 }

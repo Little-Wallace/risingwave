@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::ops::DerefMut;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
 
@@ -44,7 +45,8 @@ pub struct StoredIdGenerator<S> {
     meta_store: Arc<S>,
     category_gen_key: String,
     current_id: AtomicI32,
-    next_allocate_id: RwLock<Id>,
+    next_allocate_id_ref: Arc<AtomicI32>,
+    next_allocate_id: RwLock<Arc<AtomicI32>>,
 }
 
 impl<S> StoredIdGenerator<S>
@@ -73,12 +75,14 @@ where
         {
             panic!("{:?}", err)
         }
+        let next_allocate_id_ref = Arc::new(AtomicI32::new(next_allocate_id));
 
         StoredIdGenerator {
             meta_store,
             category_gen_key,
             current_id: AtomicI32::new(current_id),
-            next_allocate_id: RwLock::new(next_allocate_id),
+            next_allocate_id: RwLock::new(next_allocate_id_ref.clone()),
+            next_allocate_id_ref,
         }
     }
 }
@@ -90,15 +94,22 @@ where
 {
     async fn generate_interval(&self, interval: i32) -> MetadataModelResult<Id> {
         let id = self.current_id.fetch_add(interval, Ordering::Relaxed);
-        let next_allocate_id = { *self.next_allocate_id.read().await };
+        let next_allocate_id = self.next_allocate_id_ref.load(Ordering::Acquire);
         if id + interval > next_allocate_id {
-            let mut next = self.next_allocate_id.write().await;
-            if id + interval > *next {
+            let mut next_guard = self.next_allocate_id.write().await;
+            let next = next_guard.deref_mut();
+            let current_allocate_id = next.load(Ordering::Relaxed);
+            if id + interval > current_allocate_id {
                 let weight = num_integer::Integer::div_ceil(
-                    &(id + interval - *next),
+                    &(id + interval - current_allocate_id),
                     &ID_PREALLOCATE_INTERVAL,
                 );
-                let next_allocate_id = *next + ID_PREALLOCATE_INTERVAL * weight;
+                let next_allocate_id = current_allocate_id + ID_PREALLOCATE_INTERVAL * weight;
+                tracing::info!(
+                    "increase generate id from {} to {}",
+                    current_allocate_id,
+                    next_allocate_id
+                );
                 self.meta_store
                     .put_cf(
                         DEFAULT_COLUMN_FAMILY,
@@ -106,7 +117,7 @@ where
                         next_allocate_id.to_be_bytes().to_vec(),
                     )
                     .await?;
-                *next = next_allocate_id;
+                next.store(next_allocate_id, Ordering::Release);
             }
         }
 
