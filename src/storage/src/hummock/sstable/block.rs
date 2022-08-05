@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 use std::io::{Read, Write};
 use std::ops::Range;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use risingwave_hummock_sdk::VersionedComparator;
 use {lz4, zstd};
 
@@ -31,13 +31,13 @@ pub const DEFAULT_BIT_PER_KEY: usize = 7;
 
 pub struct Block {
     /// Uncompressed entries data.
-    data: Bytes,
+    data: Vec<u8>,
     /// Restart points.
     restart_points: Vec<u32>,
 }
 
 impl Block {
-    pub fn decode(buf: Bytes) -> HummockResult<Self> {
+    pub fn decode(buf: &[u8]) -> HummockResult<Self> {
         // Verify checksum.
         let xxhash64_checksum = (&buf[buf.len() - 8..]).get_u64_le();
         xxhash64_verify(&buf[..buf.len() - 8], xxhash64_checksum)?;
@@ -45,8 +45,12 @@ impl Block {
         // Decompress.
         let compression = CompressionAlgorithm::decode(&mut &buf[buf.len() - 9..buf.len() - 8])?;
         let compressed_data = &buf[..buf.len() - 9];
-        let buf = match compression {
-            CompressionAlgorithm::None => buf.slice(..buf.len() - 9),
+        let mut buf = match compression {
+            CompressionAlgorithm::None => {
+                let mut data = Vec::with_capacity(buf.len() - 9);
+                data.extend_from_slice(&buf[..(buf.len() - 9)]);
+                data
+            }
             CompressionAlgorithm::Lz4 => {
                 let mut decoder = lz4::Decoder::new(compressed_data.reader())
                     .map_err(HummockError::decode_error)?;
@@ -54,7 +58,7 @@ impl Block {
                 decoder
                     .read_to_end(&mut decoded)
                     .map_err(HummockError::decode_error)?;
-                Bytes::from(decoded)
+                decoded
             }
             CompressionAlgorithm::Zstd => {
                 let mut decoder = zstd::Decoder::new(compressed_data.reader())
@@ -63,7 +67,7 @@ impl Block {
                 decoder
                     .read_to_end(&mut decoded)
                     .map_err(HummockError::decode_error)?;
-                Bytes::from(decoded)
+                decoded
             }
         };
 
@@ -76,8 +80,10 @@ impl Block {
             restart_points.push(restart_points_buf.get_u32_le());
         }
 
+        buf.resize(data_len, 0);
+
         Ok(Block {
-            data: buf.slice(..data_len),
+            data: buf,
             restart_points,
         })
     }
@@ -115,7 +121,7 @@ impl Block {
         self.restart_points.partition_point(pred)
     }
 
-    pub fn data(&self) -> &Bytes {
+    pub fn data(&self) -> &[u8] {
         &self.data
     }
 }
@@ -362,7 +368,7 @@ mod tests {
         builder.add(&full_key(b"k3", 3), b"v03");
         builder.add(&full_key(b"k4", 4), b"v04");
         let buf = builder.build().to_vec();
-        let block = Box::new(Block::decode(Bytes::from(buf)).unwrap());
+        let block = Box::new(Block::decode(&buf).unwrap());
         let mut bi = BlockIterator::new(BlockHolder::from_owned_block(block));
 
         bi.seek_to_first();
@@ -406,7 +412,7 @@ mod tests {
         builder.add(&full_key(b"k3", 3), b"v03");
         builder.add(&full_key(b"k4", 4), b"v04");
         let buf = builder.build().to_vec();
-        let block = Box::new(Block::decode(Bytes::from(buf)).unwrap());
+        let block = Box::new(Block::decode(&buf).unwrap());
         let mut bi = BlockIterator::new(BlockHolder::from_owned_block(block));
 
         bi.seek_to_first();

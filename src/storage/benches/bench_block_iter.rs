@@ -55,8 +55,7 @@ fn bench_block_iter(c: &mut Criterion) {
         &data,
         |b, data| {
             b.iter(|| {
-                let block =
-                    BlockHolder::from_owned_block(Box::new(Block::decode(data.clone()).unwrap()));
+                let block = BlockHolder::from_owned_block(Box::new(Block::decode(&data).unwrap()));
                 block_iter_next(block)
             });
         },

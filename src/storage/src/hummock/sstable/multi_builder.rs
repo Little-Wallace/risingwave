@@ -173,7 +173,6 @@ mod tests {
     use std::sync::atomic::Ordering::SeqCst;
 
     use itertools::Itertools;
-    use lz4::BlockSize::Default;
 
     use super::*;
     use crate::hummock::iterator::test_utils::mock_sstable_store;
