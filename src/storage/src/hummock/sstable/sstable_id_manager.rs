@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use risingwave_hummock_sdk::{HummockSstableId, SstIdRange};
-use risingwave_rpc_client::HummockMetaClient;
+use risingwave_pb::meta::heartbeat_request::extra_info::Info;
+use risingwave_rpc_client::{ExtraInfoSource, HummockMetaClient};
 use tokio::sync::Mutex;
 
 use crate::hummock::{HummockError, HummockResult};
@@ -87,5 +88,12 @@ impl SstableIdManager {
                 .get_next_sst_id()
                 .ok_or_else(|| HummockError::meta_error("get_new_sst_ids RPC returns empty result"))
         }
+    }
+}
+
+impl ExtraInfoSource for SstableIdManager {
+    fn get_extra_info(&self) -> Option<Info> {
+        // TODO: use correct value after #4369
+        None
     }
 }
