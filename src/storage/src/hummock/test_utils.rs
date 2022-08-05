@@ -93,6 +93,7 @@ pub fn default_builder_opt_for_test() -> SstableBuilderOptions {
         restart_interval: DEFAULT_RESTART_INTERVAL,
         bloom_false_positive: 0.1,
         compression_algorithm: CompressionAlgorithm::None,
+        ..Default::default()
     }
 }
 

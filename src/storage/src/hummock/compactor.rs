@@ -54,7 +54,9 @@ use crate::hummock::sstable_store::SstableStoreRef;
 use crate::hummock::state_store::ForwardIter;
 use crate::hummock::utils::{can_concat, MemoryLimiter, MemoryTracker};
 use crate::hummock::vacuum::Vacuum;
-use crate::hummock::{CachePolicy, HummockError, SstableBuilder, SstableIdManagerRef};
+use crate::hummock::{
+    CachePolicy, HummockError, SstableBuilder, SstableIdManagerRef, DEFAULT_ENTRY_SIZE,
+};
 use crate::monitor::{StateStoreMetrics, StoreLocalStatistic};
 
 pub struct RemoteBuilderFactory {
@@ -74,9 +76,9 @@ impl TableBuilderFactory for RemoteBuilderFactory {
         let tracker = self
             .limiter
             .require_memory(
-                self.options.capacity as u64
-                    + self.options.block_capacity as u64
-                    + self.options.estimate_bloom_filter_capacity,
+                (self.options.capacity
+                    + self.options.block_capacity
+                    + self.options.estimate_bloom_filter_capacity) as u64,
             )
             .await
             .unwrap();
@@ -696,6 +698,9 @@ impl Compactor {
             .context
             .filter_key_extractor_manager
             .estimate_bloom_filter_size(options.capacity);
+        if options.estimate_bloom_filter_capacity == 0 {
+            options.estimate_bloom_filter_capacity = options.capacity / DEFAULT_ENTRY_SIZE;
+        }
         let builder_factory = RemoteBuilderFactory {
             sstable_id_manager: self.context.sstable_id_manager.clone(),
             limiter: self.context.memory_limiter.clone(),

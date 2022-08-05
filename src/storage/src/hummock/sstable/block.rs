@@ -27,6 +27,7 @@ use crate::hummock::{HummockError, HummockResult};
 pub const DEFAULT_BLOCK_SIZE: usize = 4 * 1024;
 pub const DEFAULT_RESTART_INTERVAL: usize = 16;
 pub const DEFAULT_ENTRY_SIZE: usize = 16;
+pub const DEFAULT_BIT_PER_KEY: usize = 7;
 
 pub struct Block {
     /// Uncompressed entries data.

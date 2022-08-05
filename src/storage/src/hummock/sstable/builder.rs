@@ -25,6 +25,7 @@ use super::{
     DEFAULT_ENTRY_SIZE, DEFAULT_RESTART_INTERVAL, VERSION,
 };
 use crate::hummock::value::HummockValue;
+use crate::hummock::DEFAULT_BIT_PER_KEY;
 
 pub const DEFAULT_SSTABLE_SIZE: usize = 4 * 1024 * 1024;
 pub const DEFAULT_BLOOM_FALSE_POSITIVE: f64 = 0.1;
@@ -103,7 +104,9 @@ impl SstableBuilder {
             }),
             block_metas: Vec::with_capacity(options.capacity / options.block_capacity + 1),
             table_ids: BTreeSet::new(),
-            user_key_hashes: Vec::with_capacity(options.capacity / DEFAULT_ENTRY_SIZE + 1),
+            user_key_hashes: Vec::with_capacity(
+                options.estimate_bloom_filter_capacity / DEFAULT_BIT_PER_KEY + 1,
+            ),
             last_table_id: 0,
             options,
             key_count: 0,
@@ -244,6 +247,7 @@ pub(super) mod tests {
             restart_interval: 16,
             bloom_false_positive: 0.1,
             compression_algorithm: CompressionAlgorithm::None,
+            estimate_bloom_filter_capacity: 0,
         };
 
         let b = SstableBuilder::new(0, opt);
@@ -274,6 +278,7 @@ pub(super) mod tests {
             restart_interval: 16,
             bloom_false_positive: if with_blooms { 0.01 } else { 0.0 },
             compression_algorithm: CompressionAlgorithm::None,
+            estimate_bloom_filter_capacity: 0,
         };
 
         // build remote table

@@ -173,6 +173,7 @@ mod tests {
     use std::sync::atomic::Ordering::SeqCst;
 
     use itertools::Itertools;
+    use lz4::BlockSize::Default;
 
     use super::*;
     use crate::hummock::iterator::test_utils::mock_sstable_store;
@@ -218,6 +219,7 @@ mod tests {
                 restart_interval: DEFAULT_RESTART_INTERVAL,
                 bloom_false_positive: 0.1,
                 compression_algorithm: CompressionAlgorithm::None,
+                estimate_bloom_filter_capacity: 0,
             },
         );
         let builder = CapacitySplitTableBuilder::new(
@@ -241,6 +243,7 @@ mod tests {
                 restart_interval: DEFAULT_RESTART_INTERVAL,
                 bloom_false_positive: 0.1,
                 compression_algorithm: CompressionAlgorithm::None,
+                ..Default::default()
             },
         );
         let mut builder = CapacitySplitTableBuilder::new(
