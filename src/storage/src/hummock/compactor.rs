@@ -73,7 +73,11 @@ impl TableBuilderFactory for RemoteBuilderFactory {
         self.remote_rpc_cost.fetch_add(cost, Ordering::Relaxed);
         let tracker = self
             .limiter
-            .require_memory(self.options.capacity as u64 + self.options.block_capacity as u64)
+            .require_memory(
+                self.options.capacity as u64
+                    + self.options.block_capacity as u64
+                    + self.options.estimate_bloom_filter_capacity,
+            )
             .await
             .unwrap();
         let builder = SstableBuilder::new(table_id, self.options.clone());
@@ -688,6 +692,10 @@ impl Compactor {
             1 => CompressionAlgorithm::Lz4,
             _ => CompressionAlgorithm::Zstd,
         };
+        options.estimate_bloom_filter_capacity = self
+            .context
+            .filter_key_extractor_manager
+            .estimate_bloom_filter_size(options.capacity);
         let builder_factory = RemoteBuilderFactory {
             sstable_id_manager: self.context.sstable_id_manager.clone(),
             limiter: self.context.memory_limiter.clone(),
@@ -732,6 +740,13 @@ impl Compactor {
             data_len,
         } in sealed_builders
         {
+            // bloomfilter occuppy per thousand keys
+            self.context
+                .filter_key_extractor_manager
+                .update_bloom_filter_avg_size(
+                    meta.estimated_size as usize,
+                    meta.bloom_filter.len(),
+                );
             let sst = Sstable::new(table_id, meta);
             let len = data_len;
             ssts.push((sst, table_ids));
