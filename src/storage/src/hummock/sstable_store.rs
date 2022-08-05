@@ -86,11 +86,33 @@ impl SstableStore {
         }
     }
 
+    pub async fn put_sst(
+        &self,
+        sst_id: HummockSstableId,
+        meta: SstableMeta,
+        data: Bytes,
+        policy: CachePolicy,
+    ) -> HummockResult<()> {
+        self.put_sst_data(sst_id, data.clone()).await?;
+        fail_point!("metadata_upload_err");
+        if let Err(e) = self.put_meta(sst_id, &meta).await {
+            self.delete_sst_data(sst_id).await?;
+            return Err(e);
+        }
+        if let CachePolicy::Fill = policy {
+            let sst = Sstable::new_with_data(sst_id, meta, data).unwrap();
+            let charge = sst.estimate_size();
+            self.meta_cache
+                .insert(sst_id, sst_id, charge, Box::new(sst));
+        }
+        Ok(())
+    }
+
     pub async fn put(&self, sst: Sstable, data: Bytes, policy: CachePolicy) -> HummockResult<()> {
         let charge = sst.estimate_size();
         self.put_sst_data(sst.id, data).await?;
         fail_point!("metadata_upload_err");
-        if let Err(e) = self.put_meta(&sst).await {
+        if let Err(e) = self.put_meta(sst.id, &sst.meta).await {
             self.delete_sst_data(sst.id).await?;
             return Err(e);
         }
@@ -121,9 +143,9 @@ impl SstableStore {
         self.meta_cache.erase(sst_id, &sst_id);
     }
 
-    async fn put_meta(&self, sst: &Sstable) -> HummockResult<()> {
-        let meta_path = self.get_sst_meta_path(sst.id);
-        let meta = Bytes::from(sst.meta.encode_to_bytes());
+    async fn put_meta(&self, sst_id: HummockSstableId, meta: &SstableMeta) -> HummockResult<()> {
+        let meta_path = self.get_sst_meta_path(sst_id);
+        let meta = Bytes::from(meta.encode_to_bytes());
         self.store
             .upload(&meta_path, meta)
             .await

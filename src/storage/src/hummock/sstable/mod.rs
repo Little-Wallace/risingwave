@@ -115,7 +115,7 @@ impl Sstable {
     #[inline]
     pub fn estimate_size(&self) -> usize {
         8 /* id */ + self.meta.encoded_size() +
-            self.blocks.iter().map(|block|block.data().len() + block.restart_point_len() * 4).sum::<usize>()
+            self.blocks.iter().map(|block|block.capacity() + block.restart_point_len() * 4).sum::<usize>()
     }
 
     #[cfg(test)]
