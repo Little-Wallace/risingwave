@@ -176,7 +176,12 @@ def section_cluster_node(panels):
         panels.timeseries_memory("Node Memory", [
             panels.target(
                 "avg(process_resident_memory_bytes) by (job,instance)", "{{job}} @ {{instance}}"
-            )]),
+            ),
+            panels.target(
+                "sum(state_store_meta_cache_size) by (instance) + sum(state_store_limit_memory_size) by (instance)",
+                "statistic memory {{instance}}"
+            ),
+        ]),
         panels.timeseries_cpu("Node CPU", [
             panels.target(
                 "sum(rate(process_cpu_seconds_total[$__rate_interval])) by (job,instance)", "{{job}} @ {{instance}}"

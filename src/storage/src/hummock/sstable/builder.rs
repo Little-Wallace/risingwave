@@ -103,7 +103,9 @@ impl SstableBuilder {
             }),
             block_metas: Vec::with_capacity(options.capacity / options.block_capacity + 1),
             table_ids: BTreeSet::new(),
-            user_key_hashes: Vec::with_capacity(options.estimate_bloom_filter_capacity / std::mem::size_of::<u32>()),
+            user_key_hashes: Vec::with_capacity(
+                options.estimate_bloom_filter_capacity / std::mem::size_of::<u32>(),
+            ),
             last_table_id: 0,
             options,
             key_count: 0,

@@ -713,7 +713,10 @@ impl Compactor {
         if options.estimate_bloom_filter_capacity == 0 {
             options.estimate_bloom_filter_capacity = options.capacity / DEFAULT_ENTRY_SIZE;
         }
-        tracing::warn!("estimate bloom filter capacity: {}", options.estimate_bloom_filter_capacity);
+        tracing::warn!(
+            "estimate bloom filter capacity: {}",
+            options.estimate_bloom_filter_capacity
+        );
         let builder_factory = RemoteBuilderFactory {
             sstable_id_manager: self.context.sstable_id_manager.clone(),
             limiter: self.context.memory_limiter.clone(),

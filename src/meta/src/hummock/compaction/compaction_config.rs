@@ -50,7 +50,7 @@ impl CompactionConfigBuilder {
                     "None".to_string(),
                     "None".to_string(),
                     "None".to_string(),
-                    "Lz4".to_string(),
+                    "None".to_string(),
                     "Lz4".to_string(),
                     "Zstd".to_string(),
                     "Zstd".to_string(),

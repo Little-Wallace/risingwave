@@ -138,6 +138,12 @@ impl<F: TableBuilderFactory> CapacitySplitTableBuilder<F> {
                 file_size: meta.estimated_size as u64,
                 table_ids,
             };
+            tracing::info!(
+                "generate new file {} bloom_filter: {}, meta_size: {}",
+                sst_info.file_size,
+                bloom_filter_size,
+                meta.encoded_size()
+            );
             let policy = self.policy;
             let tracker = self.tracker.take();
             let upload_join_handle = tokio::spawn(async move {
