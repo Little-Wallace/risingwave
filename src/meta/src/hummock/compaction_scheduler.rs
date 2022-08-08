@@ -121,6 +121,10 @@ where
         compaction_group: CompactionGroupId,
         request_channel: Arc<CompactionRequestChannel>,
     ) -> bool {
+        if self.hummock_manager.get_pending_compact_task_count().await >= 15 {
+            return false;
+        }
+
         // 1. Pick a compaction task.
         let compact_task = self
             .hummock_manager

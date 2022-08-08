@@ -643,6 +643,12 @@ where
     }
 
     #[named]
+    pub async fn get_pending_compact_task_count(&self) -> usize {
+        let compaction_guard = read_lock!(self, compaction).await;
+        compaction_guard.compact_task_assignment.len()
+    }
+
+    #[named]
     pub async fn get_compact_task_impl(
         &self,
         compaction_group_id: CompactionGroupId,
