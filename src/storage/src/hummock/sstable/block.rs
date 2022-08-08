@@ -350,6 +350,8 @@ impl BlockBuilder {
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
     use crate::hummock::{BlockHolder, BlockIterator};
 
@@ -362,7 +364,7 @@ mod tests {
         builder.add(&full_key(b"k3", 3), b"v03");
         builder.add(&full_key(b"k4", 4), b"v04");
         let buf = builder.build().to_vec();
-        let block = Box::new(Block::decode(&Bytes::from(buf)).unwrap());
+        let block = Box::new(Block::decode(&buf).unwrap());
         let mut bi = BlockIterator::new(BlockHolder::from_owned_block(block));
 
         bi.seek_to_first();
@@ -406,7 +408,7 @@ mod tests {
         builder.add(&full_key(b"k3", 3), b"v03");
         builder.add(&full_key(b"k4", 4), b"v04");
         let buf = builder.build().to_vec();
-        let block = Box::new(Block::decode(&Bytes::from(buf)).unwrap());
+        let block = Box::new(Block::decode(&buf).unwrap());
         let mut bi = BlockIterator::new(BlockHolder::from_owned_block(block));
 
         bi.seek_to_first();
