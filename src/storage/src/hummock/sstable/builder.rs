@@ -167,6 +167,7 @@ impl SstableBuilder {
         };
         self.build_block();
         self.buf.put_u32_le(self.block_metas.len() as u32);
+        tracing::info!("capacity: {}, {}", self.buf.len(), self.buf.capacity());
         assert!(!smallest_key.is_empty());
 
         let meta = SstableMeta {
