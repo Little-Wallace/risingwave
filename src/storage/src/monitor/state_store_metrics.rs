@@ -22,10 +22,9 @@ use prometheus::{
     IntGauge, Opts, Registry,
 };
 use risingwave_common::monitor::Print;
-use risingwave_hummock_sdk::HummockSstableId;
 
 use crate::hummock::sstable_store::SstableStoreRef;
-use crate::hummock::{BlockCache, LruCache, MemoryLimiter, Sstable};
+use crate::hummock::{BlockCache, MemoryLimiter};
 
 /// Define all metrics.
 #[macro_export]
@@ -441,7 +440,7 @@ impl StateStoreMetrics {
 
 struct StateStoreCollector {
     block_cache: BlockCache,
-    meta_cache: Arc<LruCache<HummockSstableId, Box<Sstable>>>,
+    sstable_store: SstableStoreRef,
     descs: Vec<Desc>,
     block_cache_size: IntGauge,
     meta_cache_size: IntGauge,
@@ -475,7 +474,7 @@ impl StateStoreCollector {
 
         Self {
             block_cache: sstable_store.get_block_cache(),
-            meta_cache: sstable_store.get_meta_cache(),
+            sstable_store,
             descs,
             block_cache_size,
             meta_cache_size,
@@ -493,7 +492,7 @@ impl Collector for StateStoreCollector {
     fn collect(&self) -> Vec<proto::MetricFamily> {
         self.block_cache_size.set(self.block_cache.size() as i64);
         self.meta_cache_size
-            .set(self.meta_cache.get_memory_usage() as i64);
+            .set(self.sstable_store.get_memory_usage() as i64);
         self.limit_memory_size
             .set(self.memory_limiter.get_memory_usage() as i64);
 

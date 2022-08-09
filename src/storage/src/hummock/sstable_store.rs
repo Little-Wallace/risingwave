@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use std::clone::Clone;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -50,6 +50,7 @@ pub struct SstableStore {
     store: ObjectStoreRef,
     block_cache: BlockCache,
     meta_cache: Arc<LruCache<HummockSstableId, Box<Sstable>>>,
+    loading_memory: Arc<AtomicUsize>,
 }
 
 impl SstableStore {
@@ -69,6 +70,7 @@ impl SstableStore {
             store,
             block_cache: BlockCache::new(block_cache_capacity, MAX_CACHE_SHARD_BITS),
             meta_cache,
+            loading_memory: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -86,6 +88,7 @@ impl SstableStore {
             store,
             block_cache: BlockCache::new(block_cache_capacity, 2),
             meta_cache,
+            loading_memory: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -261,6 +264,10 @@ impl SstableStore {
         self.block_cache.clone()
     }
 
+    pub fn get_memory_usage(&self) -> usize {
+        self.meta_cache.get_memory_usage() + self.loading_memory.load(Ordering::Relaxed)
+    }
+
     #[cfg(any(test, feature = "test"))]
     pub fn clear_block_cache(&self) {
         self.block_cache.clear();
@@ -288,6 +295,7 @@ impl SstableStore {
                     let data_path = self.get_sst_data_path(sst_id);
                     stats.cache_meta_block_miss += 1;
                     let stats_ptr = stats.remote_io_time.clone();
+                    let uploading_memory = self.loading_memory.clone();
                     async move {
                         let now = Instant::now();
                         let meta = match meta_data {
@@ -301,11 +309,16 @@ impl SstableStore {
                             }
                         };
                         let sst = if load_data {
+                            uploading_memory
+                                .fetch_add(meta.estimated_size as usize, Ordering::SeqCst);
                             let block_data = store
                                 .read(&data_path, None)
                                 .await
                                 .map_err(HummockError::object_io_error)?;
-                            Sstable::new_with_data(sst_id, meta, block_data)?
+                            let sst = Sstable::new_with_data(sst_id, meta, block_data)?;
+                            uploading_memory
+                                .fetch_sub(sst.meta.estimated_size as usize, Ordering::SeqCst);
+                            sst
                         } else {
                             Sstable::new(sst_id, meta)
                         };
