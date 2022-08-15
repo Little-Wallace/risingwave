@@ -128,10 +128,7 @@ async fn compact_shared_buffer(
             Arc::new(SstableIteratorReadOptions::default()),
         )
         .await?;
-        let compaction_executor = context.compaction_executor.clone();
-
-        let split_task = async move { compactor.run(iter).await };
-        let rx = Compactor::request_execution(compaction_executor, split_task)?;
+        let rx = tokio::spawn(async move { compactor.run(iter).await });
         compaction_futures.push(rx);
     }
     local_stats.report(stats.as_ref());
