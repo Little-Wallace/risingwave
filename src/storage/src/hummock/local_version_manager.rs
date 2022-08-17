@@ -425,21 +425,24 @@ impl LocalVersionManager {
         batch: SharedBufferBatch,
         is_remote_batch: bool,
     ) {
-        let mut local_version_guard = self.local_version.write();
-        // Try get shared buffer
-        let shared_buffer = match local_version_guard.get_mut_shared_buffer(epoch) {
-            Some(shared_buffer) => shared_buffer,
-            None => local_version_guard
-                .new_shared_buffer(epoch, self.buffer_tracker.global_upload_task_size.clone()),
-        };
+        // Try get shared buffer with version read lock
+        let shared_buffer = self.local_version.read().get_shared_buffer(epoch);
+
+        // New a shared buffer with version write lock if shared buffer of the corresponding epoch
+        // does not exist before
+        let shared_buffer = shared_buffer.unwrap_or_else(|| {
+            self.local_version
+                .write()
+                .new_shared_buffer(epoch, self.buffer_tracker.global_upload_task_size.clone())
+        });
 
         // Write into shared buffer
         if is_remote_batch {
             // The batch won't be synced to S3 asynchronously if it is a remote batch
-            shared_buffer.replicate_batch(batch);
+            shared_buffer.write().replicate_batch(batch);
         } else {
             // The batch will be synced to S3 asynchronously if it is a local batch
-            shared_buffer.write_batch(batch);
+            shared_buffer.write().write_batch(batch);
         }
 
         // Notify the buffer tracker after the batch has been added to shared buffer.
@@ -460,12 +463,12 @@ impl LocalVersionManager {
         // The current implementation is a trivial one, which issue only one flush task and wait for
         // the task to finish.
         let mut task = None;
-        for (epoch, shared_buffer) in self.local_version.write().iter_mut_shared_buffer() {
+        for (epoch, shared_buffer) in self.local_version.read().iter_shared_buffer() {
             // skip the epoch that is being synced
             if syncing_epoch.get(epoch).is_some() {
                 continue;
             }
-            if let Some(upload_task) = shared_buffer.new_upload_task() {
+            if let Some(upload_task) = shared_buffer.write().new_upload_task() {
                 task = Some((*epoch, upload_task));
                 break;
             }
@@ -528,17 +531,15 @@ impl LocalVersionManager {
             // We keep the lock on max_sync_epoch until the task is saved in the sync task vec.
             let mut local_version_guard = self.local_version.write();
             local_version_guard.set_max_sync_epoch(epoch);
-            let (uncommitted_data, task_write_batch_size) = match local_version_guard
-                .get_mut_shared_buffer(epoch)
-                .unwrap()
-                .take_uncommitted_data()
-            {
-                Some(task) => task,
-                None => {
-                    tracing::trace!("sync epoch {} has no more task to do", epoch);
-                    return Ok((0, vec![]));
-                }
-            };
+            let shard_buffer = local_version_guard.get_shared_buffer(epoch).unwrap();
+            let (uncommitted_data, task_write_batch_size) =
+                match shard_buffer.write().take_uncommitted_data() {
+                    Some(task) => task,
+                    None => {
+                        tracing::trace!("sync epoch {} has no more task to do", epoch);
+                        return Ok((0, vec![]));
+                    }
+                };
             local_version_guard.add_sync_state(epoch, Syncing(uncommitted_data.clone()));
             (uncommitted_data, task_write_batch_size)
         };
@@ -598,10 +599,11 @@ impl LocalVersionManager {
     ) -> HummockResult<()> {
         let task_result = self.shared_buffer_uploader.flush(epoch, task_payload).await;
 
-        let mut local_version_guard = self.local_version.write();
-        let shared_buffer_guard = local_version_guard
-            .get_mut_shared_buffer(epoch)
-            .expect("shared buffer should exist since some uncommitted data is not committed yet");
+        let shared_buffer =
+            self.local_version.read().get_shared_buffer(epoch).expect(
+                "shared buffer should exist since some uncommitted data is not committed yet",
+            );
+        let mut shared_buffer_guard = shared_buffer.write();
 
         let ret = match task_result {
             Ok(ssts) => {

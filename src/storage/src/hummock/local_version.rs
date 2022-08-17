@@ -34,7 +34,7 @@ use crate::hummock::utils::{filter_single_sst, range_overlap};
 
 #[derive(Debug, Clone)]
 pub struct LocalVersion {
-    shared_buffer: BTreeMap<HummockEpoch, SharedBuffer>,
+    shared_buffer: BTreeMap<HummockEpoch, Arc<RwLock<SharedBuffer>>>,
     pinned_version: Arc<PinnedVersion>,
     pub version_ids_in_use: BTreeSet<HummockVersionId>,
     // TODO: save uncommitted data that needs to be flushed to disk.
@@ -125,12 +125,8 @@ impl LocalVersion {
         self.max_sync_epoch = epoch;
     }
 
-    pub fn get_mut_shared_buffer(&mut self, epoch: HummockEpoch) -> Option<&mut SharedBuffer> {
-        self.shared_buffer.get_mut(&epoch)
-    }
-
-    pub fn get_shared_buffer(&self, epoch: HummockEpoch) -> Option<&SharedBuffer> {
-        self.shared_buffer.get(&epoch)
+    pub fn get_shared_buffer(&self, epoch: HummockEpoch) -> Option<Arc<RwLock<SharedBuffer>>> {
+        self.shared_buffer.get(&epoch).cloned()
     }
 
     pub fn add_sync_state(
@@ -162,24 +158,21 @@ impl LocalVersion {
         *node.unwrap() = (sync_epoch, sync_uncommitted_data);
     }
 
-    pub fn iter_shared_buffer(&self) -> impl Iterator<Item = (&HummockEpoch, &SharedBuffer)> {
+    pub fn iter_shared_buffer(
+        &self,
+    ) -> impl Iterator<Item = (&HummockEpoch, &Arc<RwLock<SharedBuffer>>)> {
         self.shared_buffer.iter()
-    }
-
-    pub fn iter_mut_shared_buffer(
-        &mut self,
-    ) -> impl Iterator<Item = (&HummockEpoch, &mut SharedBuffer)> {
-        self.shared_buffer.iter_mut()
     }
 
     pub fn new_shared_buffer(
         &mut self,
         epoch: HummockEpoch,
         global_upload_task_size: Arc<AtomicUsize>,
-    ) -> &mut SharedBuffer {
+    ) -> Arc<RwLock<SharedBuffer>> {
         self.shared_buffer
             .entry(epoch)
-            .or_insert_with(|| SharedBuffer::new(global_upload_task_size))
+            .or_insert_with(|| Arc::new(RwLock::new(SharedBuffer::new(global_upload_task_size))))
+            .clone()
     }
 
     /// Returns epochs cleaned from shared buffer.
@@ -221,7 +214,7 @@ impl LocalVersion {
         B: AsRef<[u8]>,
     {
         use parking_lot::RwLockReadGuard;
-        let (pinned_version, (shared_buffer_datas, sync_uncommitted_datas)) = {
+        let (pinned_version, (shared_buffers, sync_uncommitted_datas)) = {
             let guard = this.read();
             let smallest_uncommitted_epoch = guard.pinned_version.max_committed_epoch() + 1;
             let pinned_version = guard.pinned_version.clone();
@@ -232,8 +225,8 @@ impl LocalVersion {
                         .shared_buffer
                         .range(smallest_uncommitted_epoch..=read_epoch)
                         .rev() // Important: order by epoch descendingly
-                        .map(|(_, shared_buffer)| shared_buffer.get_overlap_data(key_range))
-                        .collect();
+                        .map(|(_, shared_buffer)| shared_buffer.clone())
+                        .collect_vec();
                     let result_sync: Vec<OrderSortedUncommittedData> = guard
                         .sync_uncommitted_data
                         .iter()
@@ -250,6 +243,10 @@ impl LocalVersion {
                 },
             )
         };
+        let shared_buffer_datas = shared_buffers
+            .iter()
+            .map(|shared_buffer| shared_buffer.read().get_overlap_data(key_range))
+            .collect_vec();
 
         ReadVersion {
             shared_buffer_datas,

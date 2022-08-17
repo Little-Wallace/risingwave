@@ -163,7 +163,7 @@ pub(crate) async fn build_ordered_merge_iter<T: HummockIteratorType>(
     Ok(OrderedMergeIteratorInner::new(ordered_iters, stats.clone()))
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SharedBuffer {
     uncommitted_data: KeyIndexedUncommittedData,
     replicate_batches: BTreeMap<Vec<u8>, SharedBufferBatch>,
