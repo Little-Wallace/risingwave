@@ -148,12 +148,14 @@ impl DynamicLevelSelector {
         }
 
         let base_bytes_max = self.config.max_bytes_for_level_base;
-        let base_bytes_min = base_bytes_max / self.config.max_bytes_for_level_multiplier;
+        let base_bytes_min =
+            base_bytes_max / std::cmp::max(self.config.max_bytes_for_level_multiplier / 2, 2);
 
         let mut cur_level_size = max_level_size;
         for _ in first_non_empty_level..self.config.max_level as usize {
             cur_level_size /= self.config.max_bytes_for_level_multiplier;
         }
+        let level_multiplier = self.config.max_bytes_for_level_multiplier;
 
         let base_level_size = if cur_level_size <= base_bytes_min {
             // Case 1. If we make target size of last level to be max_level_size,
@@ -163,14 +165,13 @@ impl DynamicLevelSelector {
             base_bytes_min + 1
         } else {
             ctx.base_level = first_non_empty_level;
-            while ctx.base_level > 1 && cur_level_size > base_bytes_max {
+            while ctx.base_level > 1 && cur_level_size / level_multiplier > base_bytes_min {
                 ctx.base_level -= 1;
-                cur_level_size /= self.config.max_bytes_for_level_multiplier;
+                cur_level_size /= level_multiplier;
             }
             std::cmp::min(base_bytes_max, cur_level_size)
         };
 
-        let level_multiplier = self.config.max_bytes_for_level_multiplier as f64;
         let mut level_size = base_level_size;
         for i in ctx.base_level..=self.config.max_level as usize {
             // Don't set any level below base_bytes_max. Otherwise, the LSM can
@@ -178,7 +179,7 @@ impl DynamicLevelSelector {
             // causes compaction scoring, which depends on level sizes, to favor L1+
             // at the expense of L0, which may fill up and stall.
             ctx.level_max_bytes[i] = std::cmp::max(level_size, base_bytes_max);
-            level_size = (level_size as f64 * level_multiplier) as u64;
+            level_size = level_size * level_multiplier;
         }
         ctx
     }
@@ -321,12 +322,37 @@ impl LevelSelector for DynamicLevelSelector {
         level_handlers: &mut [LevelHandler],
     ) -> Option<CompactionTask> {
         let ctx = self.get_priority_levels(levels, level_handlers);
-        for (score, select_level, target_level) in ctx.score_levels {
-            if score <= SCORE_BASE {
-                return None;
-            }
+        let score_levels = ctx
+            .score_levels
+            .into_iter()
+            .filter(|(score, _, _)| *score > SCORE_BASE)
+            .collect_vec();
+        if score_levels.is_empty() {
+            return None;
+        }
+        for (_, select_level, target_level) in score_levels {
             let picker = self.create_compaction_picker(select_level, target_level);
             if let Some(ret) = picker.pick_compaction(levels, level_handlers) {
+                // compaction in base level.
+                if select_level != 0 {
+                    let mut select_bytes = 0;
+                    let mut target_bytes = 0;
+                    for level in &ret.input_levels {
+                        let level_file_size = level
+                            .table_infos
+                            .iter()
+                            .map(|table| table.file_size)
+                            .sum::<u64>();
+                        if level.level_idx as usize == select_level {
+                            select_bytes += level_file_size;
+                        } else {
+                            target_bytes += level_file_size;
+                        }
+                    }
+                    if target_bytes > select_bytes * self.config.max_write_amplification {
+                        continue;
+                    }
+                }
                 ret.add_pending_task(task_id, level_handlers);
                 return Some(self.create_compaction_task(ret, ctx.base_level));
             }
@@ -496,8 +522,8 @@ pub mod tests {
         let ctx = selector.calculate_level_base_size(&levels);
         assert_eq!(ctx.base_level, 2);
         assert_eq!(ctx.level_max_bytes[2], 100);
-        assert_eq!(ctx.level_max_bytes[3], 200);
-        assert_eq!(ctx.level_max_bytes[4], 1000);
+        assert_eq!(ctx.level_max_bytes[3], 255);
+        assert_eq!(ctx.level_max_bytes[4], 1275);
 
         levels.levels[3]
             .table_infos
@@ -510,18 +536,16 @@ pub mod tests {
 
         let ctx = selector.calculate_level_base_size(&levels);
         // data size increase, so we need increase one level to place more data.
-        assert_eq!(ctx.base_level, 1);
-        assert_eq!(ctx.level_max_bytes[1], 100);
-        assert_eq!(ctx.level_max_bytes[2], 120);
-        assert_eq!(ctx.level_max_bytes[3], 600);
+        assert_eq!(ctx.base_level, 2);
+        assert_eq!(ctx.level_max_bytes[2], 100);
+        assert_eq!(ctx.level_max_bytes[3], 500);
         assert_eq!(ctx.level_max_bytes[4], 3000);
 
         // append a large data to L0 but it does not change the base size of LSM tree.
         push_tables_level0(&mut levels, generate_tables(20..26, 0..1000, 1, 100));
 
         let ctx = selector.calculate_level_base_size(&levels);
-        assert_eq!(ctx.base_level, 1);
-        assert_eq!(ctx.level_max_bytes[1], 100);
+        assert_eq!(ctx.base_level, 2);
         assert_eq!(ctx.level_max_bytes[2], 120);
         assert_eq!(ctx.level_max_bytes[3], 600);
         assert_eq!(ctx.level_max_bytes[4], 3000);

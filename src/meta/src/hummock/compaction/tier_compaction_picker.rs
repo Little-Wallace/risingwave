@@ -138,6 +138,7 @@ impl TierCompactionPicker {
                 self.config.max_compaction_bytes,
                 self.config.max_bytes_for_level_base,
             );
+            let mut max_level_size = level.total_file_size;
 
             for other in &l0.sub_levels[idx + 1..] {
                 if compaction_bytes >= max_compaction_bytes {
@@ -157,6 +158,7 @@ impl TierCompactionPicker {
                 }
 
                 compaction_bytes += other.total_file_size;
+                max_level_size = std::cmp::max(max_level_size, other.total_file_size);
                 select_level_inputs.push(InputLevel {
                     level_idx: 0,
                     level_type: other.level_type,
@@ -164,17 +166,11 @@ impl TierCompactionPicker {
                 });
             }
 
-            if select_level_inputs
-                .iter()
-                .map(|level| level.table_infos.len())
-                .sum::<usize>()
-                < self.config.level0_tier_compact_file_number as usize
-            {
+            if select_level_inputs.len() <= self.config.level0_tier_compact_file_number as usize {
                 continue;
             }
 
-            if select_level_inputs.len() <= self.config.level0_tier_compact_file_number as usize / 2
-            {
+            if max_level_size * self.config.level0_tier_compact_file_number / 2 > compaction_bytes {
                 continue;
             }
 
@@ -252,14 +248,12 @@ impl CompactionPicker for TierCompactionPicker {
             return None;
         }
 
-        if let Some(input) = self.pick_trivial_move_file(l0, level_handlers) {
-            return Some(input);
+        if let Some(ret) = self.pick_trivial_move_file(l0, level_handlers) {
+            return Some(ret);
         }
-
-        if let Some(input) = self.pick_overlapping_level(l0, &level_handlers[0]) {
-            return Some(input);
+        if let Some(ret) = self.pick_sharding_level(l0, &level_handlers[0]) {
+            return Some(ret);
         }
-
-        self.pick_sharding_level(l0, &level_handlers[0])
+        self.pick_overlapping_level(l0, &level_handlers[0])
     }
 }

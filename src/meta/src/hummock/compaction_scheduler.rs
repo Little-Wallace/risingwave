@@ -113,8 +113,15 @@ where
                     break 'compaction_trigger;
                 }
             };
-            self.pick_and_assign(compaction_group, request_channel.clone())
+            if !self
+                .pick_and_assign(compaction_group, request_channel.clone())
+                .await
+            {
+                tokio::time::sleep(Duration::from_secs(
+                    self.compactor_selection_retry_interval_sec,
+                ))
                 .await;
+            }
         }
         tracing::info!("Compaction scheduler is stopped");
     }
@@ -171,6 +178,15 @@ where
             {
                 None => {
                     tracing::warn!("No idle compactor available.");
+                    compact_task.task_status = false;
+                    if self
+                        .hummock_manager
+                        .report_compact_task_impl(META_NODE_ID, &compact_task, true)
+                        .await
+                        .is_ok()
+                    {
+                        return false;
+                    }
                     tokio::time::sleep(Duration::from_secs(
                         self.compactor_selection_retry_interval_sec,
                     ))

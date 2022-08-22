@@ -20,6 +20,7 @@ use risingwave_hummock_sdk::HummockContextId;
 use risingwave_pb::hummock::subscribe_compact_tasks_response::Task;
 use risingwave_pb::hummock::SubscribeCompactTasksResponse;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tracing::warn;
 
 use crate::hummock::HummockManager;
 use crate::storage::MetaStore;
@@ -106,6 +107,7 @@ impl CompactorManager {
         S: MetaStore,
     {
         let mut visited = HashSet::new();
+        let mut last_assigned_task_number = 0;
         loop {
             match self.next_compactor() {
                 None => {
@@ -113,13 +115,17 @@ impl CompactorManager {
                 }
                 Some(compactor) => {
                     if visited.contains(&compactor.context_id()) {
+                        warn!(
+                            "the compactor has been assigned {} task, while the max task is: {}",
+                            last_assigned_task_number,
+                            compactor.max_concurrent_task_number()
+                        );
                         return None;
                     }
-                    if hummock_manager
+                    last_assigned_task_number = hummock_manager
                         .get_assigned_tasks_number(compactor.context_id())
-                        .await
-                        <= compactor.max_concurrent_task_number()
-                    {
+                        .await;
+                    if last_assigned_task_number <= compactor.max_concurrent_task_number() {
                         return Some(compactor);
                     }
                     visited.insert(compactor.context_id());

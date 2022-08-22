@@ -362,4 +362,5 @@ message CompactionConfig {
   uint64 target_file_size_base = 10;
   uint32 compaction_filter_mask = 11;
   uint32 max_sub_compaction = 12;
+  uint64 max_write_amplification = 13;
 }

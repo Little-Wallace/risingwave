@@ -103,8 +103,13 @@ impl CompactionPicker for LevelCompactionPicker {
             });
 
             let mut l0_total_file_size = l0.sub_levels[0].total_file_size;
+            let target_file_score =
+                cal_file_size(&levels.get_level(self.target_level).table_infos) * 100;
+
             for level in l0.sub_levels[1..].iter() {
-                if l0_total_file_size >= self.config.max_compaction_bytes {
+                if l0_total_file_size >= self.config.max_compaction_bytes
+                    && target_file_score / l0_total_file_size >= MAX_WRITE_AMPLIFICATION
+                {
                     break;
                 }
                 if level_handlers[0].is_level_pending_compact(level) {
@@ -117,11 +122,7 @@ impl CompactionPicker for LevelCompactionPicker {
                     table_infos: level.table_infos.clone(),
                 });
             }
-
-            let all_level_amplification =
-                cal_file_size(&levels.get_level(self.target_level).table_infos) * 100
-                    / l0_total_file_size;
-            if write_amplification < all_level_amplification {
+            if target_file_score / l0_total_file_size > MAX_WRITE_AMPLIFICATION {
                 return None;
             }
             // reverse because the ix of low sub-level is smaller.

@@ -738,7 +738,7 @@ where
         &self,
         context_id: HummockContextId,
         compact_task: &CompactTask,
-        trivial_move: bool,
+        no_compactor_assign: bool,
     ) -> Result<bool> {
         let mut compaction_guard = write_lock!(self, compaction).await;
         let start_time = Instant::now();
@@ -759,7 +759,7 @@ where
 
         // For trivial_move task, there is no need to check the task assignment because
         // we won't populate compact_task_assignment for it.
-        if !trivial_move {
+        if !no_compactor_assign {
             match assignee_context_id {
                 Some(id) => {
                     // Assignee id mismatch.
@@ -792,7 +792,7 @@ where
             let mut version_delta = HummockVersionDelta {
                 prev_id: old_version.id,
                 max_committed_epoch: old_version.max_committed_epoch,
-                trivial_move,
+                trivial_move: no_compactor_assign,
                 ..Default::default()
             };
             let level_deltas = &mut version_delta
@@ -822,7 +822,7 @@ where
             version_delta.id = new_version_id;
             hummock_version_deltas.insert(version_delta.id, version_delta);
 
-            if trivial_move {
+            if no_compactor_assign {
                 commit_multi_var!(
                     self,
                     assignee_context_id,

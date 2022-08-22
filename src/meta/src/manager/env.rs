@@ -90,7 +90,7 @@ impl Default for MetaOpts {
             in_flight_barrier_nums: 40,
             vacuum_interval_sec: 30,
             sst_retention_time_sec: 3600 * 24 * 7,
-            compactor_selection_retry_interval_sec: 5,
+            compactor_selection_retry_interval_sec: 2,
             collect_gc_watermark_spin_interval_sec: 5,
         }
     }
