@@ -88,7 +88,6 @@ impl HummockStorageV1 {
             sync_uncommitted_data,
         } = self.read_filter(epoch, &read_options, &(table_key..=table_key))?;
 
-        let mut table_counts = 0;
         let full_key = FullKey::new(table_id, table_key, epoch);
 
         // Query shared buffer. Return the value without iterating SSTs if found
@@ -103,16 +102,11 @@ impl HummockStorageV1 {
             )
             .await?;
             if let Some(v) = value {
-                local_stats.report_bloom_filter_metrics(
-                    self.state_store_metrics.as_ref(),
-                    "get",
-                    table_id_label,
-                    false,
-                );
-                local_stats.report(self.state_store_metrics.as_ref(), table_id_label);
+                local_stats
+                    .report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
                 return Ok(v.into_user_value());
             }
-            table_counts += table_count;
+            local_stats.sub_iter_count += table_count as u64;
         }
         for sync_uncommitted_data in sync_uncommitted_data {
             let (value, table_count) = get_from_order_sorted_uncommitted_data(
@@ -124,16 +118,11 @@ impl HummockStorageV1 {
             )
             .await?;
             if let Some(v) = value {
-                local_stats.report_bloom_filter_metrics(
-                    self.state_store_metrics.as_ref(),
-                    "get",
-                    table_id_label,
-                    false,
-                );
-                local_stats.report(self.state_store_metrics.as_ref(), table_id_label);
+                local_stats
+                    .report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
                 return Ok(v.into_user_value());
             }
-            table_counts += table_count;
+            local_stats.sub_iter_count += table_count as u64;
         }
 
         let dist_key_hash = read_options.prefix_hint.as_ref().map(|dist_key| {
@@ -155,7 +144,7 @@ impl HummockStorageV1 {
                     let sstable_infos =
                         prune_ssts(level.table_infos.iter(), table_id, &(table_key..=table_key));
                     for sstable_info in sstable_infos {
-                        table_counts += 1;
+                        local_stats.sub_iter_count += 1;
                         if let Some(v) = get_from_sstable_info(
                             self.sstable_store.clone(),
                             sstable_info,
@@ -166,13 +155,10 @@ impl HummockStorageV1 {
                         )
                         .await?
                         {
-                            local_stats.report_bloom_filter_metrics(
+                            local_stats.report_for_get(
                                 self.state_store_metrics.as_ref(),
-                                "get",
-                                table_id_label,
-                                false,
+                                &read_options.table_id,
                             );
-                            local_stats.report(self.state_store_metrics.as_ref(), table_id_label);
                             return Ok(v.into_user_value());
                         }
                     }
@@ -197,7 +183,7 @@ impl HummockStorageV1 {
                         continue;
                     }
 
-                    table_counts += 1;
+                    local_stats.sub_iter_count += 1;
                     if let Some(v) = get_from_sstable_info(
                         self.sstable_store.clone(),
                         &level.table_infos[table_info_idx],
@@ -208,30 +194,16 @@ impl HummockStorageV1 {
                     )
                     .await?
                     {
-                        local_stats.report_bloom_filter_metrics(
+                        local_stats.report_for_get(
                             self.state_store_metrics.as_ref(),
-                            "get",
-                            table_id_label,
-                            false,
+                            &read_options.table_id,
                         );
-                        local_stats.report(self.state_store_metrics.as_ref(), table_id_label);
                         return Ok(v.into_user_value());
                     }
                 }
             }
         }
-
-        local_stats.report_bloom_filter_metrics(
-            self.state_store_metrics.as_ref(),
-            "get",
-            table_id_label,
-            true,
-        );
-        local_stats.report(self.state_store_metrics.as_ref(), table_id_label);
-        self.state_store_metrics
-            .iter_merge_sstable_counts
-            .with_label_values(&["", "sub-iter"])
-            .observe(table_counts as f64);
+        local_stats.report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
         Ok(None)
     }
 
@@ -439,22 +411,11 @@ impl HummockStorageV1 {
             .in_span(Span::enter_with_local_parent("rewind"))
             .await?;
 
-        let table_id_string = read_options.table_id.to_string();
-        let table_id_label = table_id_string.as_str();
-        local_stats.report_bloom_filter_metrics(
-            self.state_store_metrics.as_ref(),
-            "iter",
-            table_id_label,
-            user_iterator.is_valid(),
-        );
-
-        local_stats.report(
-            self.state_store_metrics.as_ref(),
-            table_id.to_string().as_str(),
-        );
+        local_stats.report_for_iter(self.state_store_metrics.as_ref(), &table_id);
         Ok(HummockStateStoreIter::new(
             user_iterator,
             self.state_store_metrics.clone(),
+            table_id,
         ))
     }
 }
@@ -650,8 +611,16 @@ pub struct HummockStateStoreIter {
 
 impl HummockStateStoreIter {
     #[allow(dead_code)]
-    fn new(inner: DirectedUserIterator, metrics: Arc<HummockStateStoreMetrics>) -> Self {
-        Self { inner, metrics }
+    fn new(
+        inner: DirectedUserIterator,
+        metrics: Arc<HummockStateStoreMetrics>,
+        table_id: TableId,
+    ) -> Self {
+        Self {
+            inner,
+            metrics,
+            table_id,
+        }
     }
 
     fn collect_local_statistic(&self, stats: &mut StoreLocalStatistic) {
@@ -683,6 +652,6 @@ impl Drop for HummockStateStoreIter {
     fn drop(&mut self) {
         let mut stats = StoreLocalStatistic::default();
         self.collect_local_statistic(&mut stats);
-        stats.report(&self.metrics, "");
+        stats.report_for_iter(self.metrics.as_ref(), &self.table_id);
     }
 }
