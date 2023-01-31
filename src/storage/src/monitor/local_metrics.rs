@@ -271,3 +271,183 @@ impl Drop for StoreLocalStatistic {
         }
     }
 }
+
+struct LocalStoreMetrics {
+    cache_data_block_total: GenericLocalCounter<prometheus::core::AtomicU64>,
+    cache_data_block_miss: GenericLocalCounter<prometheus::core::AtomicU64>,
+    cache_meta_block_total: GenericLocalCounter<prometheus::core::AtomicU64>,
+    cache_meta_block_miss: GenericLocalCounter<prometheus::core::AtomicU64>,
+    remote_io_time: LocalHistogram,
+    processed_key_count: GenericLocalCounter<prometheus::core::AtomicU64>,
+    skip_multi_version_key_count: GenericLocalCounter<prometheus::core::AtomicU64>,
+    skip_delete_key_count: GenericLocalCounter<prometheus::core::AtomicU64>,
+    total_key_count: GenericLocalCounter<prometheus::core::AtomicU64>,
+    get_shared_buffer_hit_counts: GenericLocalCounter<prometheus::core::AtomicU64>,
+    staging_imm_iter_count: LocalHistogram,
+    staging_sst_iter_count: LocalHistogram,
+    overlapping_iter_count: LocalHistogram,
+    non_overlapping_iter_count: LocalHistogram,
+    iter_filter_metrics: BloomFilterLocalMetrics,
+    get_filter_metrics: BloomFilterLocalMetrics,
+    collect_count: usize,
+}
+
+const FLUSH_LOCAL_METRICS_TIMES: usize = 32;
+
+impl LocalStoreMetrics {
+    pub fn new(metrics: &HummockStateStoreMetrics, table_id_label: &str) -> Self {
+        let cache_data_block_total = metrics
+            .sst_store_block_request_counts
+            .with_label_values(&[table_id_label, "data_total"])
+            .local();
+
+        let cache_data_block_miss = metrics
+            .sst_store_block_request_counts
+            .with_label_values(&[table_id_label, "data_miss"])
+            .local();
+
+        let cache_meta_block_total = metrics
+            .sst_store_block_request_counts
+            .with_label_values(&[table_id_label, "meta_total"])
+            .local();
+
+        let cache_meta_block_miss = metrics
+            .sst_store_block_request_counts
+            .with_label_values(&[table_id_label, "meta_miss"])
+            .local();
+
+        let remote_io_time = metrics
+            .remote_read_time
+            .with_label_values(&[table_id_label])
+            .local();
+
+        let processed_key_count = metrics
+            .iter_scan_key_counts
+            .with_label_values(&[table_id_label, "processed"])
+            .local();
+
+        let skip_multi_version_key_count = metrics
+            .iter_scan_key_counts
+            .with_label_values(&[table_id_label, "skip_multi_version"])
+            .local();
+
+        let skip_delete_key_count = metrics
+            .iter_scan_key_counts
+            .with_label_values(&[table_id_label, "skip_delete"])
+            .local();
+
+        let total_key_count = metrics
+            .iter_scan_key_counts
+            .with_label_values(&[table_id_label, "total"])
+            .local();
+
+        let get_shared_buffer_hit_counts = metrics
+            .get_shared_buffer_hit_counts
+            .with_label_values(&[table_id_label])
+            .local();
+
+        let staging_imm_iter_count = metrics
+            .iter_merge_sstable_counts
+            .with_label_values(&[table_id_label, "staging-imm-iter"])
+            .local();
+        let staging_sst_iter_count = metrics
+            .iter_merge_sstable_counts
+            .with_label_values(&[table_id_label, "staging-sst-iter"])
+            .local();
+        let overlapping_iter_count = metrics
+            .iter_merge_sstable_counts
+            .with_label_values(&[table_id_label, "committed-overlapping-iter"])
+            .local();
+        let non_overlapping_iter_count = metrics
+            .iter_merge_sstable_counts
+            .with_label_values(&[table_id_label, "committed-non-overlapping-iter"])
+            .local();
+        let get_filter_metrics = BloomFilterLocalMetrics::new(metrics, table_id_label, "get");
+        let iter_filter_metrics = BloomFilterLocalMetrics::new(metrics, table_id_label, "iter");
+        Self {
+            cache_data_block_total,
+            cache_data_block_miss,
+            cache_meta_block_total,
+            cache_meta_block_miss,
+            remote_io_time,
+            processed_key_count,
+            skip_multi_version_key_count,
+            skip_delete_key_count,
+            total_key_count,
+            get_shared_buffer_hit_counts,
+            staging_imm_iter_count,
+            staging_sst_iter_count,
+            overlapping_iter_count,
+            non_overlapping_iter_count,
+            get_filter_metrics,
+            iter_filter_metrics,
+            collect_count: 0,
+        }
+    }
+
+    pub fn flush(&mut self) {
+        self.cache_data_block_total.flush();
+        self.cache_data_block_miss.flush();
+        self.cache_meta_block_total.flush();
+        self.cache_meta_block_miss.flush();
+        self.remote_io_time.flush();
+        self.skip_multi_version_key_count.flush();
+        self.skip_delete_key_count.flush();
+        self.get_shared_buffer_hit_counts.flush();
+        self.total_key_count.flush();
+        self.processed_key_count.flush();
+        self.iter_filter_metrics.flush();
+        self.get_filter_metrics.flush();
+    }
+}
+
+pub struct BloomFilterLocalMetrics {
+    bloom_filter_check_counts: GenericLocalCounter<prometheus::core::AtomicU64>,
+    read_req_check_bloom_filter_counts: GenericLocalCounter<prometheus::core::AtomicU64>,
+    bloom_filter_true_negative_counts: GenericLocalCounter<prometheus::core::AtomicU64>,
+    read_req_positive_but_non_exist_counts: GenericLocalCounter<prometheus::core::AtomicU64>,
+    read_req_bloom_filter_positive_counts: GenericLocalCounter<prometheus::core::AtomicU64>,
+}
+
+impl BloomFilterLocalMetrics {
+    pub fn new(metrics: &HummockStateStoreMetrics, table_id_label: &str, oper_type: &str) -> Self {
+        // checks SST bloom filters
+        let bloom_filter_check_counts = metrics
+            .bloom_filter_check_counts
+            .with_label_values(&[table_id_label, oper_type])
+            .local();
+
+        let read_req_check_bloom_filter_counts = metrics
+            .read_req_check_bloom_filter_counts
+            .with_label_values(&[table_id_label, oper_type])
+            .local();
+
+        let bloom_filter_true_negative_counts = metrics
+            .bloom_filter_true_negative_counts
+            .with_label_values(&[table_id_label, oper_type])
+            .local();
+        let read_req_positive_but_non_exist_counts = metrics
+            .read_req_positive_but_non_exist_counts
+            .with_label_values(&[table_id_label, oper_type])
+            .local();
+        let read_req_bloom_filter_positive_counts = metrics
+            .read_req_bloom_filter_positive_counts
+            .with_label_values(&[table_id_label, oper_type])
+            .local();
+        Self {
+            bloom_filter_check_counts,
+            read_req_check_bloom_filter_counts,
+            bloom_filter_true_negative_counts,
+            read_req_positive_but_non_exist_counts,
+            read_req_bloom_filter_positive_counts,
+        }
+    }
+
+    pub fn flush(&mut self) {
+        self.bloom_filter_check_counts.flush();
+        self.read_req_check_bloom_filter_counts.flush();
+        self.bloom_filter_true_negative_counts.flush();
+        self.read_req_positive_but_non_exist_counts.flush();
+        self.read_req_bloom_filter_positive_counts.flush();
+    }
+}
