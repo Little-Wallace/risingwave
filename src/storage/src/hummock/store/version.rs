@@ -427,6 +427,7 @@ impl HummockVersionReader {
                 return Ok(data.into_user_value());
             }
         }
+        local_stats.found_key = true;
 
         // 2. order guarantee: imm -> sst
         let dist_key_hash = read_options.prefix_hint.as_ref().map(|dist_key| {
@@ -541,19 +542,8 @@ impl HummockVersionReader {
                 }
             }
         }
-
-        local_stats.report_bloom_filter_metrics(
-            self.state_store_metrics.as_ref(),
-            "get",
-            table_id_label,
-            true,
-        );
-        local_stats.report(self.state_store_metrics.as_ref(), table_id_label);
-        self.state_store_metrics
-            .iter_merge_sstable_counts
-            .with_label_values(&[table_id_label, "sub-iter"])
-            .observe(table_counts as f64);
-
+        local_stats.found_key = false;
+        local_stats.report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
         Ok(None)
     }
 
