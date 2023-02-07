@@ -433,7 +433,7 @@ impl HummockVersionReader {
 
         let full_key = FullKey::new(read_options.table_id, table_key, epoch);
         for local_sst in &uncommitted_ssts {
-            table_counts += 1;
+            local_stats.sub_iter_count += 1;
             if let Some(data) = get_from_sstable_info(
                 self.sstable_store.clone(),
                 local_sst,
@@ -506,7 +506,7 @@ impl HummockVersionReader {
                         continue;
                     }
 
-                    table_counts += 1;
+                    local_stats.sub_iter_count += 1;
                     if let Some(v) = get_from_sstable_info(
                         self.sstable_store.clone(),
                         &level.table_infos[table_info_idx],

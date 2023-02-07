@@ -34,6 +34,7 @@ use super::{
 use crate::hummock::sstable::bloom::{BloomFilterBuilder, FilterBuilder};
 use crate::hummock::value::HummockValue;
 use crate::hummock::{DeleteRangeTombstone, HummockResult};
+use crate::hummock::sstable::ribbon_filter::RibbonFilterBuilder;
 
 pub const DEFAULT_SSTABLE_SIZE: usize = 4 * 1024 * 1024;
 pub const DEFAULT_BLOOM_FALSE_POSITIVE: f64 = 0.001;
@@ -115,7 +116,7 @@ pub struct SstableBuilder<W: SstableWriter> {
     /// `last_table_stats` accumulates stats for `last_table_id` and finalizes it in `table_stats`
     /// by `finalize_last_table_stats`
     last_table_stats: TableStats,
-    filter_builder: BloomFilterBuilder,
+    filter_builder: RibbonFilterBuilder,
 }
 
 impl<W: SstableWriter> SstableBuilder<W> {
@@ -144,10 +145,7 @@ impl<W: SstableWriter> SstableBuilder<W> {
                 restart_interval: options.restart_interval,
                 compression_algorithm: options.compression_algorithm,
             }),
-            filter_builder: BloomFilterBuilder::new(
-                options.bloom_false_positive,
-                options.capacity / DEFAULT_ENTRY_SIZE + 1,
-            ),
+            filter_builder: RibbonFilterBuilder::new(15),
             block_metas: Vec::with_capacity(options.capacity / options.block_capacity + 1),
             table_ids: BTreeSet::new(),
             last_table_id: None,

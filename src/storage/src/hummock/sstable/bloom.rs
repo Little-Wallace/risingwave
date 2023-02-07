@@ -34,6 +34,8 @@ pub trait FilterBuilder {
     fn add_key(&mut self, dist_key: &[u8], table_id: u32);
     /// Builds Bloom filter from key hashes
     fn finish(&mut self) -> Vec<u8>;
+
+    fn approximate_len(&self) -> usize;
 }
 
 impl<T: AsRef<[u8]>> BitSlice for T {
@@ -132,10 +134,6 @@ impl BloomFilterBuilder {
         }
     }
 
-    pub fn approximate_len(&self) -> usize {
-        self.key_hash_entries.len() * 4
-    }
-
     /// Gets Bloom filter bits per key from entries count and FPR
     fn bloom_bits_per_key(entries: usize, false_positive_rate: f64) -> usize {
         let size = -1.0 * (entries as f64) * false_positive_rate.ln() / f64::consts::LN_2.powi(2);
@@ -147,7 +145,7 @@ impl BloomFilterBuilder {
 impl FilterBuilder for BloomFilterBuilder {
     fn add_key(&mut self, key: &[u8], table_id: u32) {
         self.key_hash_entries
-            .push(Sstable::hash_for_bloom_filter(key, table_id));
+            .push(Sstable::hash_for_bloom_filter(key, table_id) as u32);
     }
 
     fn finish(&mut self) -> Vec<u8> {
@@ -176,6 +174,10 @@ impl FilterBuilder for BloomFilterBuilder {
         filter.put_u8(k as u8);
         self.key_hash_entries.clear();
         filter
+    }
+
+    fn approximate_len(&self) -> usize {
+        self.key_hash_entries.len() * 4
     }
 }
 

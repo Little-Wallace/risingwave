@@ -54,6 +54,7 @@ risingwave_object_store = { path = "../object_store" }
 risingwave_pb = { path = "../prost" }
 risingwave_rpc_client = { path = "../rpc_client" }
 risingwave_tracing = { path = "../tracing" }
+rocksdb-util = { git = "https://github.com/rust-lib-project/rocksdb-util"}
 scopeguard = "1"
 # rocksdb = { git = "https://github.com/tikv/rust-rocksdb.git", rev = "fa83ff19", features = [
 #     "encryption",

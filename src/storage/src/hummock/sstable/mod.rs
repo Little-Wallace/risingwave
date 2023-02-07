@@ -45,14 +45,17 @@ use risingwave_pb::hummock::{KeyRange, SstableInfo};
 mod delete_range_aggregator;
 mod sstable_id_manager;
 mod utils;
+mod ribbon_filter;
+
 pub use delete_range_aggregator::{
     get_delete_range_epoch_from_sstable, DeleteRangeAggregator, DeleteRangeAggregatorBuilder,
     RangeTombstonesCollector, SstableDeleteRangeIterator,
 };
 pub use sstable_id_manager::*;
 pub use utils::CompressionAlgorithm;
+use rocksdb_util::FilterBitsReaderWrapper;
 use utils::{get_length_prefixed_slice, put_length_prefixed_slice};
-use xxhash_rust::xxh32;
+use xxhash_rust::{xxh32, xxh64};
 
 use self::utils::{xxhash64_checksum, xxhash64_verify};
 use super::{HummockError, HummockResult};
@@ -116,12 +119,16 @@ impl DeleteRangeTombstone {
     }
 }
 
+enum FilterReader {
+    Bloom(BloomFilterReader),
+    RocksDB(FilterBitsReaderWrapper),
+}
+
 /// [`Sstable`] is a handle for accessing SST.
-#[derive(Clone)]
 pub struct Sstable {
     pub id: HummockSstableId,
     pub meta: SstableMeta,
-    pub filter_reader: BloomFilterReader,
+    pub filter_reader: FilterReader,
 }
 
 impl Debug for Sstable {
@@ -136,7 +143,8 @@ impl Debug for Sstable {
 impl Sstable {
     pub fn new(id: HummockSstableId, mut meta: SstableMeta) -> Self {
         let filter_data = std::mem::take(&mut meta.bloom_filter);
-        let filter_reader = BloomFilterReader::new(filter_data);
+        // let filter_reader = BloomFilterReader::new(filter_data);
+        let filter_reader = FilterReader::RocksDB(FilterBitsReaderWrapper::create(filter_data));
         Self {
             id,
             meta,
@@ -145,7 +153,10 @@ impl Sstable {
     }
 
     pub fn has_bloom_filter(&self) -> bool {
-        !self.filter_reader.is_empty()
+        match &self.filter_reader {
+            FilterReader::RocksDB(reader) => true,
+            FilterReader::Bloom(reader) => !reader.is_empty()
+        }
     }
 
     pub fn may_match(&self, dist_key: &[u8]) -> bool {
@@ -154,22 +165,25 @@ impl Sstable {
             true
         };
         if enable_bloom_filter() && self.has_bloom_filter() {
-            let hash = xxh32::xxh32(dist_key, 0);
-            self.may_match_hash(hash)
+            let dist_key_hash = xxh64::xxh64(dist_key, 0);
+            self.may_match_hash(dist_key_hash)
         } else {
             true
         }
     }
 
     #[inline(always)]
-    pub fn hash_for_bloom_filter(dist_key: &[u8], table_id: u32) -> u32 {
-        let dist_key_hash = xxh32::xxh32(dist_key, 0);
-        table_id.bitxor(dist_key_hash)
+    pub fn hash_for_bloom_filter(dist_key: &[u8], table_id: u32) -> u64 {
+        let dist_key_hash = xxh64::xxh64(dist_key, 0);
+        (table_id as u64).bitxor(dist_key_hash)
     }
 
     #[inline(always)]
-    pub fn may_match_hash(&self, hash: u32) -> bool {
-        self.filter_reader.may_match(hash)
+    pub fn may_match_hash(&self, hash: u64) -> bool {
+        match &self.filter_reader {
+            FilterReader::RocksDB(reader) => reader.hash_may_match(hash),
+            FilterReader::Bloom(reader) => reader.may_match(hash as u32)
+        }
     }
 
     pub fn block_count(&self) -> usize {
