@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 use std::collections::{HashSet, VecDeque};
 use std::iter::once;
 use std::ops::Bound::{Excluded, Included};
-use std::ops::{Deref, RangeBounds};
+use std::ops::RangeBounds;
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -410,10 +410,7 @@ impl HummockVersionReader {
         read_options: ReadOptions,
         read_version_tuple: (Vec<ImmutableMemtable>, Vec<SstableInfo>, CommittedVersion),
     ) -> StorageResult<Option<Bytes>> {
-        let mut table_counts = 0;
         let mut local_stats = StoreLocalStatistic::default();
-        let table_id_string = read_options.table_id.to_string();
-        let table_id_label = table_id_string.as_str();
         let (imms, uncommitted_ssts, committed_version) = read_version_tuple;
         let min_epoch = gen_min_epoch(epoch, read_options.retention_seconds.as_ref());
 
@@ -447,12 +444,8 @@ impl HummockVersionReader {
             )
             .await?
             {
-                local_stats.report_bloom_filter_metrics(
-                    self.state_store_metrics.as_ref(),
-                    "get",
-                    table_id_label,
-                    false,
-                );
+                local_stats
+                    .report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
                 return Ok(data.into_user_value());
             }
         }
@@ -486,14 +479,8 @@ impl HummockVersionReader {
                         )
                         .await?
                         {
-                            local_stats.report_bloom_filter_metrics(
-                                self.state_store_metrics.as_ref(),
-                                "get",
-                                table_id_label,
-                                false,
-                            );
-                            // todo add global stat to report
-                            local_stats.report(self.state_store_metrics.as_ref(), table_id_label);
+                            local_stats
+                                .report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
                             return Ok(v.into_user_value());
                         }
                     }
@@ -530,13 +517,8 @@ impl HummockVersionReader {
                     )
                     .await?
                     {
-                        local_stats.report_bloom_filter_metrics(
-                            self.state_store_metrics.as_ref(),
-                            "get",
-                            table_id_label,
-                            false,
-                        );
-                        local_stats.report(self.state_store_metrics.as_ref(), table_id_label);
+                        local_stats
+                            .report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
                         return Ok(v.into_user_value());
                     }
                 }
@@ -792,19 +774,11 @@ impl HummockVersionReader {
             .in_span(Span::enter_with_local_parent("rewind"))
             .await?;
 
-        local_stats.report_bloom_filter_metrics(
-            self.state_store_metrics.as_ref(),
-            "iter",
-            table_id_label,
-            user_iter.is_valid(),
-        );
-
-        local_stats.report(self.state_store_metrics.deref(), table_id_label);
-
         Ok(HummockStorageIterator::new(
             user_iter,
             self.state_store_metrics.clone(),
             read_options.table_id,
+            local_stats,
         )
         .into_stream())
     }

@@ -79,8 +79,6 @@ impl HummockStorageV1 {
         read_options: ReadOptions,
     ) -> StorageResult<Option<Bytes>> {
         let table_id = read_options.table_id;
-        let table_id_string = table_id.to_string();
-        let table_id_label = table_id_string.as_str();
         let mut local_stats = StoreLocalStatistic::default();
         let ReadVersion {
             shared_buffer_data,
