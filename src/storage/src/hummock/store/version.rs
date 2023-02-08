@@ -468,7 +468,7 @@ impl HummockVersionReader {
                         &(table_key..=table_key),
                     );
                     for sstable_info in sstable_infos {
-                        table_counts += 1;
+                        local_stats.sub_iter_count += 1;
                         if let Some(v) = get_from_sstable_info(
                             self.sstable_store.clone(),
                             sstable_info,
@@ -479,8 +479,10 @@ impl HummockVersionReader {
                         )
                         .await?
                         {
-                            local_stats
-                                .report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
+                            local_stats.report_for_get(
+                                self.state_store_metrics.as_ref(),
+                                &read_options.table_id,
+                            );
                             return Ok(v.into_user_value());
                         }
                     }
@@ -517,8 +519,10 @@ impl HummockVersionReader {
                     )
                     .await?
                     {
-                        local_stats
-                            .report_for_get(self.state_store_metrics.as_ref(), &read_options.table_id);
+                        local_stats.report_for_get(
+                            self.state_store_metrics.as_ref(),
+                            &read_options.table_id,
+                        );
                         return Ok(v.into_user_value());
                     }
                 }

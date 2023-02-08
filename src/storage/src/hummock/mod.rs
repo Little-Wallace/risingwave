@@ -417,7 +417,7 @@ pub fn hit_sstable_bloom_filter(
     local_stats: &mut StoreLocalStatistic,
 ) -> bool {
     local_stats.bloom_filter_check_counts += 1;
-    let may_exist = sstable_info_ref.may_match_hash(prefix_hash);
+    let may_exist = sstable_info_ref.filter_reader.may_match_hash(prefix_hash);
     if !may_exist {
         local_stats.bloom_filter_true_negative_counts += 1;
     }

@@ -88,6 +88,7 @@ fn get_builder_options(capacity_mb: usize) -> SstableBuilderOptions {
         restart_interval: 16,
         bloom_false_positive: 0.001,
         compression_algorithm: CompressionAlgorithm::None,
+        enable_ribbon_filter: false,
     }
 }
 

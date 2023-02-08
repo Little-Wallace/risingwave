@@ -6816,7 +6816,7 @@ checksum = "3582f63211428f83597b51b2ddb88e2a91a9d52d12831f9d08f5e624e8977422"
 [[package]]
 name = "rocksdb-util"
 version = "0.1.0"
-source = "git+https://github.com/rust-lib-project/rocksdb-util#f920a97f40a492f2ba00e18b16c65075c9611a3b"
+source = "git+https://github.com/rust-lib-project/rocksdb-util#04b0943f690856b63d4a626005b65a54cb0bf860"
 dependencies = [
  "bindgen 0.57.0",
  "cc",

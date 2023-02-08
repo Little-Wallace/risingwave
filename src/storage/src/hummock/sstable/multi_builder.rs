@@ -293,6 +293,7 @@ mod tests {
             restart_interval: DEFAULT_RESTART_INTERVAL,
             bloom_false_positive: 0.1,
             compression_algorithm: CompressionAlgorithm::None,
+            enable_ribbon_filter: false,
         };
         let builder_factory = LocalTableBuilderFactory::new(1001, mock_sstable_store(), opts);
         let builder = CapacitySplitTableBuilder::for_test(builder_factory);
@@ -442,6 +443,7 @@ mod tests {
             restart_interval: DEFAULT_RESTART_INTERVAL,
             bloom_false_positive: 0.1,
             compression_algorithm: CompressionAlgorithm::None,
+            enable_ribbon_filter: false,
         };
         let table_id = TableId::new(1);
         let mut builder = DeleteRangeAggregatorBuilder::default();

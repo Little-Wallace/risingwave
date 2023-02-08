@@ -43,9 +43,10 @@ use risingwave_hummock_sdk::{HummockEpoch, HummockSstableId};
 use risingwave_pb::hummock::{KeyRange, SstableInfo};
 
 mod delete_range_aggregator;
+mod filter;
+mod ribbon_filter;
 mod sstable_id_manager;
 mod utils;
-mod ribbon_filter;
 
 pub use delete_range_aggregator::{
     get_delete_range_epoch_from_sstable, DeleteRangeAggregator, DeleteRangeAggregatorBuilder,
@@ -53,12 +54,12 @@ pub use delete_range_aggregator::{
 };
 pub use sstable_id_manager::*;
 pub use utils::CompressionAlgorithm;
-use rocksdb_util::FilterBitsReaderWrapper;
 use utils::{get_length_prefixed_slice, put_length_prefixed_slice};
-use xxhash_rust::{xxh32, xxh64};
+use xxhash_rust::xxh64;
 
 use self::utils::{xxhash64_checksum, xxhash64_verify};
 use super::{HummockError, HummockResult};
+use crate::hummock::sstable::filter::FilterReader;
 
 const DEFAULT_META_BUFFER_CAPACITY: usize = 4096;
 const MAGIC: u32 = 0x5785ab73;
@@ -119,11 +120,6 @@ impl DeleteRangeTombstone {
     }
 }
 
-enum FilterReader {
-    Bloom(BloomFilterReader),
-    RocksDB(FilterBitsReaderWrapper),
-}
-
 /// [`Sstable`] is a handle for accessing SST.
 pub struct Sstable {
     pub id: HummockSstableId,
@@ -144,18 +140,10 @@ impl Sstable {
     pub fn new(id: HummockSstableId, mut meta: SstableMeta) -> Self {
         let filter_data = std::mem::take(&mut meta.bloom_filter);
         // let filter_reader = BloomFilterReader::new(filter_data);
-        let filter_reader = FilterReader::RocksDB(FilterBitsReaderWrapper::create(filter_data));
         Self {
             id,
             meta,
-            filter_reader,
-        }
-    }
-
-    pub fn has_bloom_filter(&self) -> bool {
-        match &self.filter_reader {
-            FilterReader::RocksDB(reader) => true,
-            FilterReader::Bloom(reader) => !reader.is_empty()
+            filter_reader: FilterReader::new(filter_data),
         }
     }
 
@@ -164,7 +152,7 @@ impl Sstable {
             fail_point!("disable_bloom_filter", |_| false);
             true
         };
-        if enable_bloom_filter() && self.has_bloom_filter() {
+        if enable_bloom_filter() {
             let dist_key_hash = xxh64::xxh64(dist_key, 0);
             self.may_match_hash(dist_key_hash)
         } else {
@@ -180,10 +168,7 @@ impl Sstable {
 
     #[inline(always)]
     pub fn may_match_hash(&self, hash: u64) -> bool {
-        match &self.filter_reader {
-            FilterReader::RocksDB(reader) => reader.hash_may_match(hash),
-            FilterReader::Bloom(reader) => reader.may_match(hash as u32)
-        }
+        self.filter_reader.may_match_hash(hash)
     }
 
     pub fn block_count(&self) -> usize {

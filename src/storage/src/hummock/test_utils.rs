@@ -123,6 +123,7 @@ pub fn default_builder_opt_for_test() -> SstableBuilderOptions {
         restart_interval: DEFAULT_RESTART_INTERVAL,
         bloom_false_positive: 0.1,
         compression_algorithm: CompressionAlgorithm::None,
+        enable_ribbon_filter: false,
     }
 }
 
@@ -217,7 +218,7 @@ pub async fn gen_test_sstable_inner<B: AsRef<[u8]>>(
         )
         .await
         .unwrap();
-    table.value().as_ref().clone()
+    Sstable::new(table.value().id, table.value().meta.clone())
 }
 
 /// Generate a test table from the given `kv_iter` and put the kv value to `sstable_store`

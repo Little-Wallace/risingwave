@@ -169,6 +169,7 @@ async fn compact<I: HummockIterator<Direction = Forward>>(iter: I, sstable_store
         restart_interval: 16,
         bloom_false_positive: 0.001,
         compression_algorithm: CompressionAlgorithm::None,
+        enable_ribbon_filter: false,
     };
     let mut builder =
         CapacitySplitTableBuilder::for_test(LocalTableBuilderFactory::new(32, sstable_store, opt));

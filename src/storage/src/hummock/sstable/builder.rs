@@ -31,10 +31,11 @@ use super::{
     BlockBuilder, BlockBuilderOptions, BlockMeta, SstableMeta, SstableWriter, DEFAULT_BLOCK_SIZE,
     DEFAULT_ENTRY_SIZE, DEFAULT_RESTART_INTERVAL, VERSION,
 };
-use crate::hummock::sstable::bloom::{BloomFilterBuilder, FilterBuilder};
+use crate::hummock::sstable::bloom::BloomFilterBuilder;
+use crate::hummock::sstable::filter::FilterBuilder;
+use crate::hummock::sstable::ribbon_filter::RibbonFilterBuilder;
 use crate::hummock::value::HummockValue;
 use crate::hummock::{DeleteRangeTombstone, HummockResult};
-use crate::hummock::sstable::ribbon_filter::RibbonFilterBuilder;
 
 pub const DEFAULT_SSTABLE_SIZE: usize = 4 * 1024 * 1024;
 pub const DEFAULT_BLOOM_FALSE_POSITIVE: f64 = 0.001;
@@ -50,6 +51,8 @@ pub struct SstableBuilderOptions {
     pub bloom_false_positive: f64,
     /// Compression algorithm.
     pub compression_algorithm: CompressionAlgorithm,
+    /// enable ribbon filter
+    pub enable_ribbon_filter: bool,
 }
 
 impl From<&StorageConfig> for SstableBuilderOptions {
@@ -61,6 +64,7 @@ impl From<&StorageConfig> for SstableBuilderOptions {
             restart_interval: DEFAULT_RESTART_INTERVAL,
             bloom_false_positive: options.bloom_false_positive,
             compression_algorithm: CompressionAlgorithm::None,
+            enable_ribbon_filter: true,
         }
     }
 }
@@ -73,6 +77,7 @@ impl Default for SstableBuilderOptions {
             restart_interval: DEFAULT_RESTART_INTERVAL,
             bloom_false_positive: DEFAULT_BLOOM_FALSE_POSITIVE,
             compression_algorithm: CompressionAlgorithm::None,
+            enable_ribbon_filter: true,
         }
     }
 }
@@ -116,7 +121,7 @@ pub struct SstableBuilder<W: SstableWriter> {
     /// `last_table_stats` accumulates stats for `last_table_id` and finalizes it in `table_stats`
     /// by `finalize_last_table_stats`
     last_table_stats: TableStats,
-    filter_builder: RibbonFilterBuilder,
+    filter_builder: FilterBuilder,
 }
 
 impl<W: SstableWriter> SstableBuilder<W> {
@@ -137,6 +142,14 @@ impl<W: SstableWriter> SstableBuilder<W> {
         options: SstableBuilderOptions,
         filter_key_extractor: Arc<FilterKeyExtractorImpl>,
     ) -> Self {
+        let filter_builder = if options.enable_ribbon_filter {
+            FilterBuilder::Ribbon(RibbonFilterBuilder::new(15))
+        } else {
+            FilterBuilder::Bloom(BloomFilterBuilder::new(
+                options.bloom_false_positive,
+                options.capacity / DEFAULT_ENTRY_SIZE + 1,
+            ))
+        };
         Self {
             options: options.clone(),
             writer,
@@ -145,7 +158,7 @@ impl<W: SstableWriter> SstableBuilder<W> {
                 restart_interval: options.restart_interval,
                 compression_algorithm: options.compression_algorithm,
             }),
-            filter_builder: RibbonFilterBuilder::new(15),
+            filter_builder,
             block_metas: Vec::with_capacity(options.capacity / options.block_capacity + 1),
             table_ids: BTreeSet::new(),
             last_table_id: None,
@@ -424,6 +437,7 @@ pub(super) mod tests {
             restart_interval: 16,
             bloom_false_positive: 0.001,
             compression_algorithm: CompressionAlgorithm::None,
+            enable_ribbon_filter: false,
         };
 
         let b = SstableBuilder::for_test(0, mock_sst_writer(&opt), opt);
@@ -439,6 +453,7 @@ pub(super) mod tests {
             restart_interval: 16,
             bloom_false_positive: 0.1,
             compression_algorithm: CompressionAlgorithm::None,
+            enable_ribbon_filter: false,
         };
         let table_id = TableId::default();
         let mut b = SstableBuilder::for_test(0, mock_sst_writer(&opt), opt);
@@ -498,6 +513,7 @@ pub(super) mod tests {
             restart_interval: 16,
             bloom_false_positive: if with_blooms { 0.01 } else { 0.0 },
             compression_algorithm: CompressionAlgorithm::None,
+            enable_ribbon_filter: false,
         };
 
         // build remote table
