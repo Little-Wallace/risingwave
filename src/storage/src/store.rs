@@ -25,6 +25,7 @@ use risingwave_hummock_sdk::key::FullKey;
 use risingwave_hummock_sdk::{HummockReadEpoch, LocalSstableInfo};
 
 use crate::error::{StorageError, StorageResult};
+use crate::hummock::{bloom, ribbon_filter};
 use crate::monitor::{MonitoredStateStore, MonitoredStorageMetrics};
 use crate::storage_value::StorageValue;
 use crate::write_batch::WriteBatch;
@@ -286,6 +287,16 @@ pub struct ReadOptions {
     /// Read from historical hummock version of meta snapshot backup.
     /// It should only be used by `StorageTable` for batch query.
     pub read_version_from_backup: bool,
+}
+
+impl ReadOptions {
+    pub fn get_prefix_hint_hash(&self) -> Option<(u64, u32)> {
+        self.prefix_hint.as_ref().map(|dist_key| {
+            let h1 = ribbon_filter::hash_for_filter(dist_key.as_ref(), self.table_id.table_id);
+            let h2 = bloom::hash_for_bloom_filter(dist_key.as_ref(), self.table_id.table_id);
+            (h1, h2)
+        })
+    }
 }
 
 pub fn gen_min_epoch(base_epoch: u64, retention_seconds: Option<&u32>) -> u64 {

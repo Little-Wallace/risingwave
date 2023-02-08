@@ -54,7 +54,7 @@ use crate::hummock::sstable::SstableIteratorReadOptions;
 use crate::hummock::utils::{prune_ssts, search_sst_idx};
 use crate::hummock::{
     DeleteRangeAggregator, ForwardIter, HummockEpoch, HummockError, HummockIteratorType,
-    HummockResult, Sstable,
+    HummockResult,
 };
 use crate::monitor::{HummockStateStoreMetrics, StoreLocalStatistic};
 use crate::storage_value::StorageValue;
@@ -123,9 +123,7 @@ impl HummockStorageV1 {
             local_stats.sub_iter_count += table_count as u64;
         }
 
-        let dist_key_hash = read_options.prefix_hint.as_ref().map(|dist_key| {
-            Sstable::hash_for_bloom_filter(dist_key.as_ref(), read_options.table_id.table_id())
-        });
+        let dist_key_hash = read_options.get_prefix_hint_hash();
 
         // Because SST meta records encoded key range,
         // the filter key needs to be encoded as well.
@@ -302,10 +300,7 @@ impl HummockStorageV1 {
         );
         assert!(pinned_version.is_valid());
         // encode once
-        let bloom_filter_prefix_hash = read_options
-            .prefix_hint
-            .as_ref()
-            .map(|hint| Sstable::hash_for_bloom_filter(hint, read_options.table_id.table_id()));
+        let bloom_filter_prefix_hash = read_options.get_prefix_hint_hash();
         for level in pinned_version.levels(table_id) {
             if level.table_infos.is_empty() {
                 continue;
@@ -333,15 +328,19 @@ impl HummockStorageV1 {
 
                 let mut sstables = vec![];
                 for sstable_info in pruned_sstables {
-                    if let Some(prefix_hash) = bloom_filter_prefix_hash.as_ref() {
+                    if let Some((hash, legacy_hash)) = bloom_filter_prefix_hash.as_ref() {
                         let sstable = self
                             .sstable_store
                             .sstable(sstable_info, &mut local_stats)
                             .in_span(Span::enter_with_local_parent("get_sstable"))
                             .await?;
 
-                        if hit_sstable_bloom_filter(sstable.value(), *prefix_hash, &mut local_stats)
-                        {
+                        if hit_sstable_bloom_filter(
+                            sstable.value(),
+                            *hash,
+                            *legacy_hash,
+                            &mut local_stats,
+                        ) {
                             sstables.push((*sstable_info).clone());
                         }
                     } else {
@@ -364,10 +363,11 @@ impl HummockStorageV1 {
                         .sstable(table_info, &mut local_stats)
                         .in_span(Span::enter_with_local_parent("get_sstable"))
                         .await?;
-                    if let Some(prefix_hash) = bloom_filter_prefix_hash.as_ref() {
+                    if let Some((hash, legacy_hash)) = bloom_filter_prefix_hash {
                         if !hit_sstable_bloom_filter(
                             sstable.value(),
-                            *prefix_hash,
+                            hash,
+                            legacy_hash,
                             &mut local_stats,
                         ) {
                             continue;

@@ -18,13 +18,11 @@
 mod block;
 
 use std::fmt::{Debug, Formatter};
-use std::ops::BitXor;
 
 pub use block::*;
 mod block_iterator;
 pub use block_iterator::*;
-mod bloom;
-use bloom::BloomFilterReader;
+pub mod bloom;
 pub mod builder;
 pub use builder::*;
 pub mod writer;
@@ -44,7 +42,7 @@ use risingwave_pb::hummock::{KeyRange, SstableInfo};
 
 mod delete_range_aggregator;
 mod filter;
-mod ribbon_filter;
+pub mod ribbon_filter;
 mod sstable_id_manager;
 mod utils;
 
@@ -161,14 +159,8 @@ impl Sstable {
     }
 
     #[inline(always)]
-    pub fn hash_for_bloom_filter(dist_key: &[u8], table_id: u32) -> u64 {
-        let dist_key_hash = xxh64::xxh64(dist_key, 0);
-        (table_id as u64).bitxor(dist_key_hash)
-    }
-
-    #[inline(always)]
     pub fn may_match_hash(&self, hash: u64) -> bool {
-        self.filter_reader.may_match_hash(hash)
+        self.filter_reader.may_match(hash, 0)
     }
 
     pub fn block_count(&self) -> usize {

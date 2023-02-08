@@ -26,10 +26,10 @@ impl FilterReader {
     }
 
     #[inline(always)]
-    pub fn may_match_hash(&self, hash: u64) -> bool {
+    pub fn may_match(&self, hash: u64, legacy_hash: u32) -> bool {
         match self {
             FilterReader::RocksDB(reader) => reader.hash_may_match(hash),
-            FilterReader::Bloom(reader) => reader.may_match(hash as u32),
+            FilterReader::Bloom(reader) => reader.may_match(legacy_hash),
             FilterReader::Empty => true,
         }
     }

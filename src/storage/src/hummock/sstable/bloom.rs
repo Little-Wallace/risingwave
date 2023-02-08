@@ -15,10 +15,10 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
 use std::f64;
+use std::ops::BitXor;
 
 use bytes::BufMut;
-
-use super::Sstable;
+use xxhash_rust::xxh32;
 
 pub trait BitSlice {
     fn get_bit(&self, idx: usize) -> bool;
@@ -134,7 +134,7 @@ impl BloomFilterBuilder {
 
     pub fn add_key(&mut self, key: &[u8], table_id: u32) {
         self.key_hash_entries
-            .push(Sstable::hash_for_bloom_filter(key, table_id) as u32);
+            .push(hash_for_bloom_filter(key, table_id) as u32);
     }
 
     pub fn finish(self) -> Vec<u8> {
@@ -169,6 +169,11 @@ impl BloomFilterBuilder {
     }
 }
 
+#[inline(always)]
+pub fn hash_for_bloom_filter(dist_key: &[u8], table_id: u32) -> u32 {
+    let dist_key_hash = xxh32::xxh32(dist_key, 0);
+    table_id.bitxor(dist_key_hash)
+}
 #[cfg(test)]
 mod tests {
     use std::ops::BitXor;

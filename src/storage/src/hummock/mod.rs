@@ -350,7 +350,7 @@ pub async fn get_from_sstable_info(
     sstable_info: &SstableInfo,
     full_key: FullKey<&[u8]>,
     read_options: &ReadOptions,
-    dist_key_hash: Option<u64>,
+    dist_key_hash: Option<(u64, u32)>,
     local_stats: &mut StoreLocalStatistic,
 ) -> HummockResult<Option<HummockValue<Bytes>>> {
     let sstable = sstable_store_ref.sstable(sstable_info, local_stats).await?;
@@ -364,7 +364,12 @@ pub async fn get_from_sstable_info(
 
     // Bloom filter key is the distribution key, which is no need to be the prefix of pk, and do not
     // contain `TablePrefix` and `VnodePrefix`.
-    if let Some(hash) = dist_key_hash && !hit_sstable_bloom_filter(sstable.value(), hash, local_stats) {
+    if !dist_key_hash
+        .map(|(hash, legacy_hash)| {
+            hit_sstable_bloom_filter(sstable.value(), hash, legacy_hash, local_stats)
+        })
+        .unwrap_or(true)
+    {
         if delete_epoch.is_some() {
             return Ok(Some(HummockValue::Delete));
         }
@@ -414,10 +419,13 @@ pub async fn get_from_sstable_info(
 pub fn hit_sstable_bloom_filter(
     sstable_info_ref: &Sstable,
     prefix_hash: u64,
+    legacy_hash: u32,
     local_stats: &mut StoreLocalStatistic,
 ) -> bool {
     local_stats.bloom_filter_check_counts += 1;
-    let may_exist = sstable_info_ref.filter_reader.may_match_hash(prefix_hash);
+    let may_exist = sstable_info_ref
+        .filter_reader
+        .may_match(prefix_hash, legacy_hash);
     if !may_exist {
         local_stats.bloom_filter_true_negative_counts += 1;
     }
@@ -434,9 +442,7 @@ pub async fn get_from_order_sorted_uncommitted_data(
 ) -> StorageResult<(Option<HummockValue<Bytes>>, i32)> {
     let mut table_counts = 0;
     let epoch = full_key.epoch;
-    let dist_key_hash = read_options.prefix_hint.as_ref().map(|dist_key| {
-        Sstable::hash_for_bloom_filter(dist_key.as_ref(), read_options.table_id.table_id())
-    });
+    let dist_key_hash = read_options.get_prefix_hint_hash();
 
     let min_epoch = gen_min_epoch(epoch, read_options.retention_seconds.as_ref());
 
