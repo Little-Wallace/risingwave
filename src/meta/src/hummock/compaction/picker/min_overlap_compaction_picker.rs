@@ -26,6 +26,7 @@ pub struct MinOverlappingPicker {
     max_select_bytes: u64,
     level: usize,
     target_level: usize,
+    select_table_id: Option<u32>,
     overlap_strategy: Arc<dyn OverlapStrategy>,
 }
 
@@ -34,18 +35,20 @@ impl MinOverlappingPicker {
         level: usize,
         target_level: usize,
         max_select_bytes: u64,
+        select_table_id: Option<u32>,
         overlap_strategy: Arc<dyn OverlapStrategy>,
     ) -> MinOverlappingPicker {
         MinOverlappingPicker {
             max_select_bytes,
             level,
             target_level,
+            select_table_id,
             overlap_strategy,
         }
     }
 
     pub fn pick_tables(
-        &self,
+        &mut self,
         select_tables: &[SstableInfo],
         target_tables: &[SstableInfo],
         level_handlers: &[LevelHandler],
@@ -55,15 +58,40 @@ impl MinOverlappingPicker {
             if level_handlers[self.level].is_pending_compact(&select_tables[left].id) {
                 continue;
             }
+
+            // do not skip when size of table_ids is larger than 1 because we need to compact legacy
+            // data.
+            if select_tables[left].table_ids.len() > 1 {
+                self.select_table_id = None;
+            }
+            if self
+                .select_table_id
+                .as_ref()
+                .map(|table_id| *table_id != select_tables[left].table_ids[0])
+                .unwrap_or(false)
+            {
+                continue;
+            }
+
             let mut overlap_info = self.overlap_strategy.create_overlap_info();
             let mut select_file_size = 0;
             for (right, table) in select_tables.iter().enumerate().skip(left) {
                 if level_handlers[self.level].is_pending_compact(&table.id) {
                     break;
                 }
-                if table.table_ids != select_tables[left].table_ids {
+
+                // do not skip when size of table_ids is larger than 1 because we need to compact
+                // legacy data.
+                if select_tables[right].table_ids.len() > 1 {
+                    self.select_table_id = None;
+                }
+
+                if self.select_table_id.is_some()
+                    && table.table_ids != select_tables[left].table_ids
+                {
                     break;
                 }
+
                 if select_file_size > self.max_select_bytes {
                     break;
                 }

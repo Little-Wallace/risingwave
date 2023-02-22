@@ -154,6 +154,7 @@ mod tests {
         compact_status.level_handlers[0].add_pending_task(
             compact_task.task_id,
             compact_task.target_level as usize,
+            0,
             &[SstableInfo {
                 id: 1,
                 ..Default::default()

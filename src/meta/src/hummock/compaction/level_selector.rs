@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 //  Copyright 2023 RisingWave Labs
 //
 //  Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,6 +16,8 @@ use std::collections::HashMap;
 // This source code is licensed under both the GPLv2 (found in the
 // COPYING file in the root directory) and Apache 2.0 License
 // (found in the LICENSE.Apache file in the root directory).
+
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use risingwave_hummock_sdk::HummockCompactionTaskId;
@@ -102,6 +103,7 @@ impl DynamicLevelSelectorCore {
             } else {
                 Box::new(LevelCompactionPicker::new(
                     target_level,
+                    None,
                     self.config.clone(),
                     overlap_strategy,
                 ))
@@ -112,6 +114,7 @@ impl DynamicLevelSelectorCore {
                 select_level,
                 target_level,
                 self.config.max_bytes_for_level_base,
+                None,
                 overlap_strategy,
             ))
         }
@@ -197,7 +200,7 @@ impl DynamicLevelSelectorCore {
         );
 
         let total_size = levels.l0.as_ref().unwrap().total_file_size
-            - handlers[0].get_pending_output_file_size(ctx.base_level as u32);
+            - handlers[0].get_target_level_pending_file_size(ctx.base_level as u32);
         if idle_file_count > 0 {
             // trigger intra-l0 compaction at first when the number of files is too large.
             let l0_score =
@@ -220,8 +223,8 @@ impl DynamicLevelSelectorCore {
                 level_idx - 1
             };
             let total_size = level.total_file_size
-                + handlers[upper_level].get_pending_output_file_size(level.level_idx)
-                - handlers[level_idx].get_pending_output_file_size(level.level_idx + 1);
+                + handlers[upper_level].get_target_level_pending_file_size(level.level_idx)
+                - handlers[level_idx].get_target_level_pending_file_size(level.level_idx + 1);
             if total_size == 0 {
                 continue;
             }
@@ -263,7 +266,7 @@ impl LevelSelector for DynamicLevelSelector {
             );
             let mut stats = LocalPickerStatistic::default();
             if let Some(ret) = picker.pick_compaction(levels, level_handlers, &mut stats) {
-                ret.add_pending_task(task_id, level_handlers);
+                ret.add_pending_task(task_id, 0, level_handlers);
                 return Some(create_compaction_task(
                     dynamic_level_core.get_config(),
                     ret,
@@ -328,7 +331,7 @@ impl LevelSelector for ManualCompactionSelector {
 
         let compaction_input =
             picker.pick_compaction(levels, level_handlers, &mut LocalPickerStatistic::default())?;
-        compaction_input.add_pending_task(task_id, level_handlers);
+        compaction_input.add_pending_task(task_id, 0, level_handlers);
 
         Some(create_compaction_task(
             group.compaction_config.as_ref(),
@@ -372,7 +375,7 @@ impl LevelSelector for SpaceReclaimCompactionSelector {
             .entry(group.group_id)
             .or_insert_with(SpaceReclaimPickerState::default);
         let compaction_input = picker.pick_compaction(levels, level_handlers, state)?;
-        compaction_input.add_pending_task(task_id, level_handlers);
+        compaction_input.add_pending_task(task_id, 0, level_handlers);
 
         Some(create_compaction_task(
             dynamic_level_core.get_config(),
@@ -414,7 +417,7 @@ impl LevelSelector for TtlCompactionSelector {
             .entry(group.group_id)
             .or_insert_with(TtlPickerState::default);
         let compaction_input = picker.pick_compaction(levels, level_handlers, state)?;
-        compaction_input.add_pending_task(task_id, level_handlers);
+        compaction_input.add_pending_task(task_id, 0, level_handlers);
 
         Some(create_compaction_task(
             group.compaction_config.as_ref(),

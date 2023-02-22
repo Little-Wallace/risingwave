@@ -19,6 +19,8 @@ use risingwave_hummock_sdk::prost_key_range::KeyRangeExt;
 use risingwave_pb::hummock::compact_task::{self, TaskStatus};
 
 mod picker;
+mod split_table_level_selector;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
@@ -77,11 +79,17 @@ pub struct CompactionInput {
 }
 
 impl CompactionInput {
-    pub fn add_pending_task(&self, task_id: u64, level_handlers: &mut [LevelHandler]) {
+    pub fn add_pending_task(
+        &self,
+        task_id: u64,
+        table_id: u32,
+        level_handlers: &mut [LevelHandler],
+    ) {
         for level in &self.input_levels {
             level_handlers[level.level_idx as usize].add_pending_task(
                 task_id,
                 self.target_level,
+                table_id,
                 &level.table_infos,
             );
         }

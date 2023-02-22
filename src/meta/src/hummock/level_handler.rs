@@ -69,21 +69,28 @@ impl LevelHandler {
             .any(|table| self.compacting_files.contains_key(&table.id))
     }
 
-    pub fn add_pending_task(&mut self, task_id: u64, target_level: usize, ssts: &[SstableInfo]) {
+    pub fn add_pending_task(
+        &mut self,
+        task_id: u64,
+        target_level: usize,
+        table_id: u32,
+        sstable_infos: &[SstableInfo],
+    ) {
         let target_level = target_level as u32;
-        let mut table_ids = vec![];
+        let mut ssts = vec![];
         let mut total_file_size = 0;
-        for sst in ssts {
+        for sst in sstable_infos {
             self.compacting_files.insert(sst.id, task_id);
             total_file_size += sst.file_size;
-            table_ids.push(sst.id);
+            ssts.push(sst.id);
         }
 
         self.pending_tasks.push(RunningCompactTask {
             task_id,
             target_level,
             total_file_size,
-            ssts: table_ids,
+            ssts,
+            table_id,
         });
     }
 
@@ -98,10 +105,26 @@ impl LevelHandler {
             .sum::<u64>()
     }
 
-    pub fn get_pending_output_file_size(&self, target_level: u32) -> u64 {
+    pub fn get_target_level_pending_file_size(&self, target_level: u32) -> u64 {
         self.pending_tasks
             .iter()
             .filter(|task| task.target_level == target_level)
+            .map(|task| task.total_file_size)
+            .sum::<u64>()
+    }
+
+    pub fn get_target_table_pending_file_size(&self, table_id: u32) -> u64 {
+        self.pending_tasks
+            .iter()
+            .filter(|task| task.target_level != self.level && task.table_id == table_id)
+            .map(|task| task.total_file_size)
+            .sum::<u64>()
+    }
+
+    pub fn get_output_pending_file_size(&self) -> u64 {
+        self.pending_tasks
+            .iter()
+            .filter(|task| task.target_level != self.level)
             .map(|task| task.total_file_size)
             .sum::<u64>()
     }

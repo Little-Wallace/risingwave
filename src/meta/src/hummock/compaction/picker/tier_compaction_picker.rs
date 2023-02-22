@@ -259,10 +259,11 @@ impl TierCompactionPicker {
                 continue;
             }
 
-            let min_overlap_picker = MinOverlappingPicker::new(
+            let mut min_overlap_picker = MinOverlappingPicker::new(
                 0,
                 0,
                 self.config.sub_level_max_compaction_bytes,
+                None,
                 self.overlap_strategy.clone(),
             );
 
@@ -318,6 +319,7 @@ impl CompactionPicker for TierCompactionPicker {
         if let Some(ret) = self.pick_overlapping_level(l0, &level_handlers[0], stats) {
             return Some(ret);
         }
+
         self.pick_table_same_files(l0, &level_handlers[0], stats)
     }
 }

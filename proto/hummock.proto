@@ -274,6 +274,8 @@ message LevelHandler {
     repeated uint64 ssts = 2;
     uint64 total_file_size = 3;
     uint32 target_level = 4;
+    // 0 represent this task include several state-table
+    uint32 table_id = 5;
   }
   uint32 level = 1;
   repeated RunningCompactTask tasks = 3;
