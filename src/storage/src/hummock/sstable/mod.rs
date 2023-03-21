@@ -48,7 +48,7 @@ use risingwave_pb::hummock::{KeyRange, SstableInfo};
 mod delete_range_aggregator;
 mod filter;
 mod sstable_object_id_manager;
-mod utils;
+pub mod utils;
 
 pub use delete_range_aggregator::{
     get_delete_range_epoch_from_sstable, DeleteRangeAggregator, DeleteRangeAggregatorBuilder,
