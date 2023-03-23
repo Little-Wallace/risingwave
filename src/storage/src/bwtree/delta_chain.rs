@@ -1,11 +1,11 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use risingwave_common::util::epoch::{Epoch, INVALID_EPOCH};
 use risingwave_hummock_sdk::KeyComparator;
 use crate::bwtree::data_iterator::DataIterator;
-use crate::bwtree::INVALID_PAGE_ID;
+use crate::bwtree::{INVALID_PAGE_ID, VKey};
 
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::sorted_data_builder::{
@@ -31,7 +31,7 @@ pub struct Delta {
 pub struct DeltaChain {
     current_epoch: u64,
     start_commit_epoch: u64,
-    current_skiplist: BTreeMap<Bytes, HummockValue<Bytes>>,
+    current_skiplist: BTreeMap<VKey, HummockValue<Bytes>>,
     current_data_size: usize,
     deltas: Vec<Arc<Delta>>,
 }
@@ -51,7 +51,7 @@ impl DeltaChain {
         }
     }
 
-    pub fn insert(&mut self, key: Bytes, value: HummockValue<Bytes>) {
+    pub fn insert(&mut self, key: VKey, value: HummockValue<Bytes>) {
         self.current_data_size += key.len() + value.encoded_len() + std::mem::size_of::<u32>() * 2;
         self.current_skiplist.insert(key, value);
     }
@@ -70,9 +70,12 @@ impl DeltaChain {
             restart_interval: DEFAULT_RESTART_INTERVAL,
         });
         let mut raw_value = BytesMut::new();
+        let mut raw_key = BytesMut::new();
         for (key, value) in self.current_skiplist.iter() {
             value.encode(&mut raw_value);
-            builder.add(&key, &raw_value);
+            raw_key.put_slice(&key.user_key);
+            raw_key.put_u64(key.epoch);
+            builder.add(&raw_key, &raw_value);
         }
         let data = builder.build();
         Arc::new(Delta {
@@ -101,6 +104,7 @@ impl DeltaChain {
         let mut builder = BlockBuilder::default();
         let mut mem_item = mem_iter.next();
         let mut raw_value = BytesMut::new();
+        let mut raw_key = BytesMut::new();
         while iter.is_valid() || mem_item.is_some() {
             if let Some((key, value)) = mem_item {
                 while
@@ -116,8 +120,10 @@ impl DeltaChain {
                     }
                 }
                 value.encode(&mut raw_value);
-                builder.add(key.as_ref(), raw_value.as_ref());
+                key.encode_to(&mut raw_key);
+                builder.add(raw_key.as_ref(), raw_value.as_ref());
                 raw_value.clear();
+                raw_key.clear();
                 mem_item = mem_iter.next();
             } else {
                 builder.add(iter.key(), iter.value());
