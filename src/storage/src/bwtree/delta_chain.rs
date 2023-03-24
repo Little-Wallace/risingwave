@@ -1,18 +1,21 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use itertools::Itertools;
 use risingwave_common::util::epoch::{Epoch, INVALID_EPOCH};
+use risingwave_hummock_sdk::key::{split_key_epoch, user_key, TableKey};
 use risingwave_hummock_sdk::KeyComparator;
-use crate::bwtree::data_iterator::DataIterator;
-use crate::bwtree::{INVALID_PAGE_ID, VKey};
 
+use crate::bwtree::data_iterator::{MergedDataIterator, MergedSharedBufferIterator};
+use crate::bwtree::index_page::IndexPage;
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::sorted_data_builder::{
     BlockBuilder, BlockBuilderOptions, DEFAULT_RESTART_INTERVAL,
 };
 use crate::bwtree::sorted_record_block::SortedRecordBlock;
-use crate::bwtree::index_page::IndexPage;
+use crate::bwtree::{VKey, INVALID_PAGE_ID};
+use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::value::HummockValue;
 use crate::hummock::CompressionAlgorithm;
 
@@ -30,111 +33,226 @@ pub struct Delta {
 
 pub struct DeltaChain {
     current_epoch: u64,
-    start_commit_epoch: u64,
-    current_skiplist: BTreeMap<VKey, HummockValue<Bytes>>,
     current_data_size: usize,
-    deltas: Vec<Arc<Delta>>,
+    mem_deltas: Vec<SharedBufferBatch>,
+    history_delta: Vec<Arc<Delta>>,
+    base_page: Arc<LeafPage>,
 }
 
 impl DeltaChain {
-    pub fn is_memtable_empty(&self) -> bool {
-        self.current_skiplist.is_empty()
-    }
-
-    pub fn new(history_deltas: Vec<Arc<Delta>>) -> Self {
+    pub fn new(base_page: Arc<LeafPage>) -> Self {
         Self {
-            start_commit_epoch: 0,
-            current_skiplist: BTreeMap::new(),
             current_data_size: 0,
             current_epoch: 0,
-            deltas: history_deltas,
+            mem_deltas: vec![],
+            history_delta: vec![],
+            base_page,
         }
     }
 
-    pub fn insert(&mut self, key: VKey, value: HummockValue<Bytes>) {
-        self.current_data_size += key.len() + value.encoded_len() + std::mem::size_of::<u32>() * 2;
-        self.current_skiplist.insert(key, value);
+    pub fn ingest(&mut self, batch: SharedBufferBatch) {
+        self.current_data_size += batch.size();
+        self.mem_deltas.push(batch);
     }
 
     pub fn seal_epoch(&mut self, epoch: u64) {
-        if self.start_commit_epoch == 0 {
-            self.start_commit_epoch = epoch;
-        }
         self.current_epoch = epoch;
     }
 
-    pub fn commit(&mut self, epoch: u64) -> Arc<Delta> {
+    /// call commit after flush.
+    pub fn commit(&mut self, delta: Arc<Delta>, epoch: u64) {
+        self.mem_deltas.retain(|batch| batch.epoch() > epoch);
+        self.history_delta.push(delta.clone());
+    }
+
+    pub fn flush(&self, epoch: u64) -> Option<Arc<Delta>> {
         let mut builder = BlockBuilder::new(BlockBuilderOptions {
-            capacity: self.current_data_size,
+            capacity: self.update_size(),
             compression_algorithm: CompressionAlgorithm::None,
             restart_interval: DEFAULT_RESTART_INTERVAL,
         });
         let mut raw_value = BytesMut::new();
         let mut raw_key = BytesMut::new();
-        for (key, value) in self.current_skiplist.iter() {
-            value.encode(&mut raw_value);
-            raw_key.put_slice(&key.user_key);
-            raw_key.put_u64(key.epoch);
+        let mut min_epoch = u64::MAX;
+        let iters = self
+            .mem_deltas
+            .iter()
+            .filter(|batch| batch.epoch() <= epoch)
+            .map(|d| {
+                min_epoch = std::cmp::min(d.epoch(), min_epoch);
+                d.clone().into_forward_iter()
+            })
+            .collect_vec();
+        if iters.is_empty() {
+            return None;
+        }
+        let mut merge_iter = MergedSharedBufferIterator::new(iters);
+        merge_iter.seek_to_first();
+        while merge_iter.is_valid() {
+            merge_iter.key().encode_into(&mut raw_key);
+            merge_iter.value().encode(&mut raw_value);
             builder.add(&raw_key, &raw_value);
+            merge_iter.next();
+            raw_key.clear();
+            raw_value.clear();
         }
         let data = builder.build();
-        Arc::new(Delta {
-            raw: SortedRecordBlock::decode_from_raw(data),
-            min_epoch: self.start_commit_epoch,
+        let delta = Arc::new(Delta {
+            raw: SortedRecordBlock::decode(data, 0).unwrap(),
+            min_epoch,
             max_epoch: epoch,
-        })
+        });
+        Some(delta)
+    }
+
+    pub fn update_size(&self) -> usize {
+        self.history_delta
+            .iter()
+            .map(|delta| delta.raw.size())
+            .sum::<usize>()
+    }
+
+    pub fn buffer_size(&self) -> usize {
+        self.mem_deltas
+            .iter()
+            .map(|delta| delta.size())
+            .sum::<usize>()
     }
 
     pub fn update_count(&self) -> usize {
-        self.current_skiplist.len() + self.deltas.iter().map(|delta|delta.raw.record_count()).sum::<usize>()
+        self.history_delta.len()
     }
 
-    pub fn apply_to_page(&mut self, page: &LeafPage) -> Vec<LeafPage> {
-        let iter = page.iter();
-        let mut iters = vec![iter];
-        let mut delta_size = self.current_data_size;
-        for delta in &self.deltas {
-            delta_size += delta.raw.size();
+    pub fn get_page(&self) -> Arc<LeafPage> {
+        self.base_page.clone()
+    }
+
+    pub fn get_page_ref(&self) -> &LeafPage {
+        self.base_page.as_ref()
+    }
+
+    pub fn get(&self, key: &Bytes, epoch: u64) -> Option<Bytes> {
+        let vk = VKey {
+            user_key: key.clone(),
+            epoch,
+        };
+        let mut raw_key = BytesMut::default();
+        vk.encode_to(&mut raw_key);
+        for d in self.mem_deltas.iter().rev() {
+            if d.epoch() <= epoch {
+                if let Some(v) = d.get(TableKey(key.as_ref())) {
+                    return v.into_user_value();
+                }
+            }
+        }
+        let mut iter = self.base_page.iter();
+        iter.seek(&raw_key);
+        if iter.is_valid() && user_key(iter.key()).eq(key.as_ref()) {
+            return iter
+                .value()
+                .into_user_value()
+                .map(|v| Bytes::copy_from_slice(v));
+        }
+        None
+    }
+
+    pub fn apply_to_page(&self, safe_epoch: u64) -> Vec<LeafPage> {
+        let mut builder = BlockBuilder::new(BlockBuilderOptions {
+            capacity: SPLIT_LEAF_CAPACITY,
+            compression_algorithm: CompressionAlgorithm::None,
+            restart_interval: DEFAULT_RESTART_INTERVAL,
+        });
+        let mut iters = Vec::with_capacity(self.history_delta.len());
+        for delta in &self.history_delta {
             iters.push(delta.raw.iter());
         }
-        let mut need_split = delta_size + page.page_size() > MAX_LEAF_SIZE_LIMIT;
-        let mut iter = DataIterator::new(iters);
-        let mut mem_iter = self.current_skiplist.iter();
-        let mut pages = Vec::with_capacity(2);
-        let mut builder = BlockBuilder::default();
-        let mut mem_item = mem_iter.next();
-        let mut raw_value = BytesMut::new();
-        let mut raw_key = BytesMut::new();
-        while iter.is_valid() || mem_item.is_some() {
-            if let Some((key, value)) = mem_item {
-                while
-                    iter.is_valid() &&
-                KeyComparator::compare_encoded_full_key(key.as_ref(), iter.key()) == std::cmp::Ordering::Less {
-                    builder.add(iter.key(), iter.value());
-                    iter.next();
-                    if need_split && builder.approximate_len() > SPLIT_LEAF_SIZE {
-                        let data = builder.build();
-                        let page = LeafPage::new(SortedRecordBlock::decode_from_raw(data), INVALID_PAGE_ID);
-                        pages.push(page);
-                        builder = BlockBuilder::default();
-                    }
-                }
-                value.encode(&mut raw_value);
-                key.encode_to(&mut raw_key);
-                builder.add(raw_key.as_ref(), raw_value.as_ref());
-                raw_value.clear();
-                raw_key.clear();
-                mem_item = mem_iter.next();
-            } else {
-                builder.add(iter.key(), iter.value());
+        iters.push(self.base_page.iter());
+        let mut pages = vec![];
+        let mut merge_iter = MergedDataIterator::new(iters);
+        merge_iter.seek_to_first();
+        let mut last_user_key = vec![];
+        let mut smallest_key = self.base_page.smallest_user_key.clone();
+        let mut data_size = (self.base_page.page_size() + self.update_size());
+        let split_count = data_size / SPLIT_LEAF_SIZE;
+        let split_size = data_size / split_count;
+        while merge_iter.is_valid() {
+            let (ukey, mut epoch) = split_key_epoch(merge_iter.key());
+            let epoch = epoch.get_u64();
+            if epoch > safe_epoch
+                || (!ukey.eq(last_user_key.as_slice()) && !merge_iter.value().is_delete())
+            {
+                builder.add(merge_iter.key(), merge_iter.raw_value());
             }
-            if need_split && builder.approximate_len() > SPLIT_LEAF_SIZE {
-                let data = builder.build();
-                let page = LeafPage::new(SortedRecordBlock::decode_from_raw(data), INVALID_PAGE_ID);
-                pages.push(page);
-                builder = BlockBuilder::default();
+            if !ukey.eq(last_user_key.as_slice()) && builder.approximate_len() > split_size {
+                let largest_key = Bytes::copy_from_slice(ukey);
+                pages.push(LeafPage::new(
+                    INVALID_PAGE_ID,
+                    smallest_key,
+                    largest_key.clone(),
+                    SortedRecordBlock::decode(builder.build(), 0).unwrap(),
+                ));
+                builder = BlockBuilder::new(BlockBuilderOptions {
+                    capacity: SPLIT_LEAF_CAPACITY,
+                    compression_algorithm: CompressionAlgorithm::None,
+                    restart_interval: DEFAULT_RESTART_INTERVAL,
+                });
+                smallest_key = largest_key;
             }
+            last_user_key.clear();
+            last_user_key.extend_from_slice(ukey);
+            merge_iter.next();
+        }
+        if !builder.is_empty() {
+            pages.push(LeafPage::new(
+                INVALID_PAGE_ID,
+                smallest_key,
+                self.base_page.largest_user_key.clone(),
+                SortedRecordBlock::decode(builder.build(), 0).unwrap(),
+            ));
         }
         pages
+            .last_mut()
+            .unwrap()
+            .set_right_link(self.base_page.get_right_link());
+        pages
+    }
+
+    pub fn set_new_page(&mut self, page: Arc<LeafPage>) -> Vec<SharedBufferBatch> {
+        self.history_delta.clear();
+        // the structure of tree does not change
+        if self.base_page.get_right_link() == page.get_right_link() {
+            return vec![];
+        }
+        let batches = self
+            .mem_deltas
+            .drain_filter(|batch| {
+                page.smallest_user_key
+                    .as_ref()
+                    .le(batch.start_table_key().0)
+                    && page.largest_user_key.as_ref().gt(batch.end_table_key().0)
+            })
+            .collect_vec();
+        for batch in &batches {
+            if page.smallest_user_key.as_ref().le(batch.end_table_key().0)
+                && page.largest_user_key.as_ref().gt(batch.start_table_key().0)
+            {
+                self.mem_deltas.push(batch.copy_batch_between_range(
+                    page.smallest_user_key.as_ref(),
+                    page.largest_user_key.as_ref(),
+                ));
+            }
+        }
+        assert_eq!(self.base_page.get_page_id(), page.get_page_id());
+        self.base_page = page;
+        batches
+    }
+
+    pub fn append_delta_from_parent_page(&mut self, batches: &[SharedBufferBatch]) {
+        for batch in batches {
+            self.mem_deltas.push(batch.copy_batch_between_range(
+                self.base_page.smallest_user_key.as_ref(),
+                self.base_page.largest_user_key.as_ref(),
+            ));
+        }
     }
 }

@@ -378,6 +378,15 @@ impl<T: AsRef<[u8]>> Debug for TableKey<T> {
     }
 }
 
+pub fn get_vnode_id<T: AsRef<[u8]>>(key: &T) -> usize {
+    VirtualNode::from_be_bytes(
+        key.as_ref()[..VirtualNode::SIZE]
+            .try_into()
+            .expect("slice with incorrect length"),
+    )
+    .to_index()
+}
+
 impl<T: AsRef<[u8]>> Deref for TableKey<T> {
     type Target = T;
 
@@ -465,12 +474,7 @@ impl<T: AsRef<[u8]>> UserKey<T> {
     }
 
     pub fn get_vnode_id(&self) -> usize {
-        VirtualNode::from_be_bytes(
-            self.table_key.as_ref()[..VirtualNode::SIZE]
-                .try_into()
-                .expect("slice with incorrect length"),
-        )
-        .to_index()
+        get_vnode_id(&self.table_key.0)
     }
 }
 
@@ -700,6 +704,148 @@ impl<T: AsRef<[u8]> + Ord + Eq> Ord for FullKey<T> {
 }
 
 impl<T: AsRef<[u8]> + Ord + Eq> PartialOrd for FullKey<T> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct StateTableKey<T: AsRef<[u8]>> {
+    pub user_key: TableKey<T>,
+    pub epoch: HummockEpoch,
+}
+
+impl<T: AsRef<[u8]>> StateTableKey<T> {
+    pub fn new(table_key: TableKey<T>, epoch: HummockEpoch) -> Self {
+        Self {
+            user_key: table_key,
+            epoch,
+        }
+    }
+
+    /// Encode in to a buffer.
+    pub fn encode_into(&self, buf: &mut impl BufMut) {
+        buf.put_slice(self.user_key.as_ref());
+        buf.put_u64(self.epoch);
+    }
+
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf =
+            Vec::with_capacity(TABLE_PREFIX_LEN + self.user_key.as_ref().len() + EPOCH_LEN);
+        self.encode_into(&mut buf);
+        buf
+    }
+
+    // Encode in to a buffer.
+    pub fn encode_into_without_table_id(&self, buf: &mut impl BufMut) {
+        buf.put_slice(self.user_key.as_ref());
+        buf.put_u64(self.epoch);
+    }
+
+    pub fn encode_reverse_epoch(&self) -> Vec<u8> {
+        let mut buf =
+            Vec::with_capacity(TABLE_PREFIX_LEN + self.user_key.as_ref().len() + EPOCH_LEN);
+        buf.put_slice(self.user_key.as_ref());
+        buf.put_u64(u64::MAX - self.epoch);
+        buf
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.user_key.as_ref().is_empty()
+    }
+
+    /// Get the length of the encoded format.
+    pub fn encoded_len(&self) -> usize {
+        self.user_key.as_ref().len() + EPOCH_LEN
+    }
+}
+
+impl<'a> StateTableKey<&'a [u8]> {
+    /// Construct a [`FullKey`] from a byte slice.
+    pub fn decode(slice: &'a [u8]) -> Self {
+        let epoch_pos = slice.len() - EPOCH_LEN;
+        let epoch = (&slice[epoch_pos..]).get_u64();
+
+        Self {
+            user_key: TableKey(&slice[TABLE_PREFIX_LEN..]),
+            epoch,
+        }
+    }
+
+    /// Construct a [`FullKey`] from a byte slice without `table_id` encoded.
+    pub fn from_slice_without_table_id(slice_without_table_id: &'a [u8]) -> Self {
+        let epoch_pos = slice_without_table_id.len() - EPOCH_LEN;
+        let epoch = (&slice_without_table_id[epoch_pos..]).get_u64();
+
+        Self {
+            user_key: TableKey(&slice_without_table_id[..epoch_pos]),
+            epoch,
+        }
+    }
+
+    /// Construct a [`FullKey`] from a byte slice.
+    pub fn decode_reverse_epoch(slice: &'a [u8]) -> Self {
+        let epoch_pos = slice.len() - EPOCH_LEN;
+        let epoch = (&slice[epoch_pos..]).get_u64();
+
+        Self {
+            user_key: TableKey(&slice[..epoch_pos]),
+            epoch: u64::MAX - epoch,
+        }
+    }
+
+    pub fn to_vec(self) -> StateTableKey<Vec<u8>> {
+        self.copy_into()
+    }
+
+    pub fn copy_into<T: CopyFromSlice + AsRef<[u8]>>(self) -> StateTableKey<T> {
+        StateTableKey {
+            user_key: TableKey(T::copy_from_slice(self.user_key.0)),
+            epoch: self.epoch,
+        }
+    }
+}
+
+impl StateTableKey<Vec<u8>> {
+    /// Calling this method may accidentally cause memory allocation when converting `Vec` into
+    /// `Bytes`
+    pub fn into_bytes(self) -> StateTableKey<Bytes> {
+        StateTableKey {
+            epoch: self.epoch,
+            user_key: TableKey(Bytes::from(self.user_key.0)),
+        }
+    }
+}
+
+impl<T: AsRef<[u8]>> StateTableKey<T> {
+    pub fn to_ref(&self) -> StateTableKey<&[u8]> {
+        StateTableKey {
+            user_key: TableKey(self.user_key.as_ref()),
+            epoch: self.epoch,
+        }
+    }
+}
+
+impl StateTableKey<Vec<u8>> {
+    /// Use this method to override an old `FullKey<Vec<u8>>` with a `FullKey<&[u8]>` to own the
+    /// table key without reallocating a new `FullKey` object.
+    pub fn set(&mut self, other: StateTableKey<&[u8]>) {
+        self.user_key.clear();
+        self.user_key.extend_from_slice(other.user_key.as_ref());
+        self.epoch = other.epoch;
+    }
+}
+
+impl<T: AsRef<[u8]> + Ord + Eq> Ord for StateTableKey<T> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        // When `user_key` is the same, greater epoch comes first.
+        self.user_key
+            .cmp(&other.user_key)
+            .then_with(|| other.epoch.cmp(&self.epoch))
+    }
+}
+
+impl<T: AsRef<[u8]> + Ord + Eq> PartialOrd for StateTableKey<T> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))
     }

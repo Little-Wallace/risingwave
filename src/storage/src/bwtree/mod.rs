@@ -1,20 +1,25 @@
 use std::cmp::Ordering;
-use bytes::{Buf, BufMut, Bytes, BytesMut};
-use crate::bwtree::index_page::IndexPage;
+use std::sync::Arc;
 
+use bytes::{Buf, BufMut, Bytes, BytesMut};
+use parking_lot::RwLock;
+
+use crate::bwtree::index_page::{IndexPage, IndexPageDeltaChain};
+
+mod bwtree_engine;
 mod data_iterator;
 mod delta_chain;
+mod delta_hash_table;
+mod index_page;
 mod leaf_page;
 mod mapping_page;
 mod mapping_table;
-mod delta_hash_table;
+mod page_store;
+mod root_page;
+mod smo;
 mod sorted_data_builder;
 mod sorted_record_block;
-mod index_page;
-mod page_store;
-mod bwtree_engine;
-mod root_page;
-
+mod uploader;
 
 #[derive(Eq, PartialEq, Clone)]
 pub struct VKey {
@@ -30,7 +35,9 @@ impl PartialOrd for VKey {
 
 impl Ord for VKey {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.user_key.cmp(&other.user_key).then_with(||other.epoch.cmp(&self.epoch))
+        self.user_key
+            .cmp(&other.user_key)
+            .then_with(|| other.epoch.cmp(&self.epoch))
     }
 }
 
@@ -49,12 +56,12 @@ impl From<Bytes> for VKey {
     fn from(data: Bytes) -> Self {
         let l = data.len();
         let epoch = {
-            let mut buf = &data;
+            let mut buf = data.as_ref();
             buf.advance(l - 8);
             buf.get_u64()
         };
         Self {
-            user_key: data.slice(..(l-8)),
+            user_key: data.slice(..(l - 8)),
             epoch,
         }
     }
@@ -62,8 +69,10 @@ impl From<Bytes> for VKey {
 
 pub type PageID = u64;
 pub const INVALID_PAGE_ID: u64 = 0;
+pub const ROOT_PAGE_ID: u64 = 1;
 
+#[derive(Clone)]
 pub enum TypedPage {
-    Index(IndexPage),
+    Index(Arc<RwLock<IndexPageDeltaChain>>),
     DataPage(PageID),
 }

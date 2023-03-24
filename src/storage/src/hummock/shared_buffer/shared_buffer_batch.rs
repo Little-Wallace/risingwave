@@ -24,11 +24,11 @@ use std::sync::{Arc, LazyLock};
 use bytes::Bytes;
 use itertools::Itertools;
 use risingwave_common::catalog::TableId;
-use risingwave_hummock_sdk::key::{FullKey, TableKey, TableKeyRange, UserKey};
+use risingwave_hummock_sdk::key::{FullKey, StateTableKey, TableKey, TableKeyRange, UserKey};
 
 use crate::hummock::iterator::{
     Backward, DeleteRangeIterator, DirectionEnum, Forward, HummockIterator,
-    HummockIteratorDirection,
+    HummockIteratorDirection, UnorderedMergeIteratorInner,
 };
 use crate::hummock::utils::{range_overlap, MemoryTracker};
 use crate::hummock::value::HummockValue;
@@ -362,6 +362,28 @@ impl SharedBufferBatch {
             );
         }
     }
+
+    fn count(&self) -> usize {
+        self.inner.payload.len() + self.inner.range_tombstone_list.len()
+    }
+
+    /// Do not count range tombstone.
+    ///  Copy data between [left, right).
+    pub fn copy_batch_between_range(&self, left: &[u8], right: &[u8]) -> SharedBufferBatch {
+        let mut payload = vec![];
+        for item in &self.inner.payload {
+            if item.0.as_ref().le(left) && item.0.as_ref().gt(right) {
+                payload.push(item.clone());
+            }
+        }
+        let size = Self::measure_batch_size(&payload);
+        let inner = SharedBufferBatchInner::new(payload, vec![], size, None);
+        SharedBufferBatch {
+            inner: Arc::new(inner),
+            table_id: self.table_id,
+            epoch: self.epoch,
+        }
+    }
 }
 
 pub struct SharedBufferBatchIterator<D: HummockIteratorDirection> {
@@ -394,6 +416,60 @@ impl<D: HummockIteratorDirection> SharedBufferBatchIterator<D> {
             DirectionEnum::Backward => self.inner.len() - self.current_idx - 1,
         };
         self.inner.get(idx).unwrap()
+    }
+
+    pub fn sync_next(&mut self) {
+        assert!(self.is_valid());
+        self.current_idx += 1;
+    }
+
+    pub fn sync_rewind(&mut self) {
+        self.current_idx = 0;
+    }
+
+    pub fn sync_seek<'a>(&'a mut self, key: FullKey<&'a [u8]>) {
+        debug_assert_eq!(key.user_key.table_id, self.table_id);
+        // Perform binary search on table key because the items in SharedBufferBatch is ordered
+        // by table key.
+        let partition_point = self
+            .inner
+            .binary_search_by(|probe| probe.0[..].cmp(*key.user_key.table_key));
+        let seek_key_epoch = key.epoch;
+        match D::direction() {
+            DirectionEnum::Forward => match partition_point {
+                Ok(i) => {
+                    self.current_idx = i;
+                    // The user key part must be the same if we reach here.
+                    if self.epoch > seek_key_epoch {
+                        // Move onto the next key for forward iteration if the current key
+                        // has a larger epoch
+                        self.current_idx += 1;
+                    }
+                }
+                Err(i) => self.current_idx = i,
+            },
+            DirectionEnum::Backward => {
+                match partition_point {
+                    Ok(i) => {
+                        self.current_idx = self.inner.len() - i - 1;
+                        // The user key part must be the same if we reach here.
+                        if self.epoch < seek_key_epoch {
+                            // Move onto the prev key for backward iteration if the current key
+                            // has a smaller epoch
+                            self.current_idx += 1;
+                        }
+                    }
+                    // Seek to one item before the seek partition_point:
+                    // If i == 0, the iterator will be invalidated with self.current_idx ==
+                    // self.inner.len().
+                    Err(i) => self.current_idx = self.inner.len() - i,
+                }
+            }
+        }
+    }
+
+    pub fn table_key(&self) -> StateTableKey<&[u8]> {
+        StateTableKey::new(TableKey(&self.current_item().0), self.epoch)
     }
 }
 
@@ -433,44 +509,7 @@ impl<D: HummockIteratorDirection> HummockIterator for SharedBufferBatchIterator<
 
     fn seek<'a>(&'a mut self, key: FullKey<&'a [u8]>) -> Self::SeekFuture<'a> {
         async move {
-            debug_assert_eq!(key.user_key.table_id, self.table_id);
-            // Perform binary search on table key because the items in SharedBufferBatch is ordered
-            // by table key.
-            let partition_point = self
-                .inner
-                .binary_search_by(|probe| probe.0[..].cmp(*key.user_key.table_key));
-            let seek_key_epoch = key.epoch;
-            match D::direction() {
-                DirectionEnum::Forward => match partition_point {
-                    Ok(i) => {
-                        self.current_idx = i;
-                        // The user key part must be the same if we reach here.
-                        if self.epoch > seek_key_epoch {
-                            // Move onto the next key for forward iteration if the current key
-                            // has a larger epoch
-                            self.current_idx += 1;
-                        }
-                    }
-                    Err(i) => self.current_idx = i,
-                },
-                DirectionEnum::Backward => {
-                    match partition_point {
-                        Ok(i) => {
-                            self.current_idx = self.inner.len() - i - 1;
-                            // The user key part must be the same if we reach here.
-                            if self.epoch < seek_key_epoch {
-                                // Move onto the prev key for backward iteration if the current key
-                                // has a smaller epoch
-                                self.current_idx += 1;
-                            }
-                        }
-                        // Seek to one item before the seek partition_point:
-                        // If i == 0, the iterator will be invalidated with self.current_idx ==
-                        // self.inner.len().
-                        Err(i) => self.current_idx = self.inner.len() - i,
-                    }
-                }
-            }
+            self.sync_seek(key);
             Ok(())
         }
     }

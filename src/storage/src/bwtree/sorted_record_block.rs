@@ -17,11 +17,12 @@ use std::io::{Read, Write};
 use std::ops::Range;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use zstd::zstd_safe::WriteBuf;
 use risingwave_hummock_sdk::KeyComparator;
+use zstd::zstd_safe::WriteBuf;
 use {lz4, zstd};
 
 use crate::hummock::sstable::utils::{xxhash64_checksum, xxhash64_verify, CompressionAlgorithm};
+use crate::hummock::value::HummockValue;
 use crate::hummock::{HummockError, HummockResult};
 
 #[derive(Clone)]
@@ -74,7 +75,7 @@ impl SortedRecordBlock {
     pub fn decode_from_raw(data: Bytes) -> Self {
         // Decode restart points.
         let raw_data_len = data.len() - 8;
-        let mut buf = &data.as_slice()[raw_data_len ..];
+        let mut buf = &data.as_slice()[raw_data_len..];
         let n_restarts = buf.get_u32_le();
         let record_count = buf.get_u32_le() as usize;
         let data_len = raw_data_len - n_restarts as usize * 4;
@@ -143,6 +144,23 @@ impl SortedRecordBlock {
 
     pub fn iter<'a>(&'a self) -> BlockIterator<'a> {
         BlockIterator::new(self)
+    }
+
+    pub fn get_middle_key(&self) -> Bytes {
+        let restart_index = self.restart_points.len() / 2;
+        if restart_index == 0 {
+            let mut iter = self.iter();
+            iter.seek_to_first();
+            let mut count = 0;
+            while count < self.record_count / 2 {
+                iter.next();
+            }
+            iter.key.freeze()
+        } else {
+            let offset = self.restart_point(restart_index) as usize;
+            let prefix = KeyPrefix::decode(&mut &self.data()[offset..], offset);
+            Bytes::copy_from_slice(&self.data()[prefix.diff_key_range()])
+        }
     }
 }
 
@@ -254,9 +272,13 @@ impl<'a> BlockIterator<'a> {
         &self.key[..]
     }
 
-    pub fn value(&self) -> &[u8] {
-        assert!(self.is_valid());
+    pub fn raw_value(&self) -> &[u8] {
         &self.block.data()[self.value_range.clone()]
+    }
+
+    pub fn value(&self) -> HummockValue<&[u8]> {
+        assert!(self.is_valid());
+        HummockValue::from_slice(self.raw_value()).expect("decode error")
     }
 
     pub fn is_valid(&self) -> bool {
@@ -422,7 +444,6 @@ impl<'a> BlockIterator<'a> {
     }
 }
 
-/// Implement `PartialOrd` for ordered iter node. Compare key and use order index as tie breaker.
 impl<'a> PartialOrd for BlockIterator<'a> {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))

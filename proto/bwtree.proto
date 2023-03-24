@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package bwtree;
+
+import "catalog.proto";
+import "common.proto";
+import "compactor.proto";
+
+
+option java_package = "com.risingwave.proto";
+option optimize_for = SPEED;
+
+message TablePage {
+  uint32 table_id = 1;
+  map<uint32, uint64> vnodes = 2;
+  uint64 commit_epoch = 3;
+}
