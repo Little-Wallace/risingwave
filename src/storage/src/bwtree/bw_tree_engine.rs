@@ -43,7 +43,7 @@ pub struct CheckpointData {
     pub commited_epoch: u64,
 }
 
-pub struct RootPage {
+pub struct BwTreeEngine {
     pub(crate) vnodes: ArcSwap<HashMap<usize, TypedPage>>,
     pub(crate) page_mapping: Arc<MappingTable>,
     pub(crate) sstable_id_manager: SstableObjectIdManagerRef,
@@ -51,7 +51,7 @@ pub struct RootPage {
     updates: Mutex<HashMap<u64, DirtyPageUpdates>>,
 }
 
-impl RootPage {
+impl BwTreeEngine {
     pub async fn get(
         &self,
         table_key: TableKey<Bytes>,
@@ -78,7 +78,7 @@ impl RootPage {
         self.sstable_id_manager.get_new_sst_object_id().await
     }
 
-    pub async fn flush_inner(
+    pub async fn flush(
         &self,
         kv_pairs: Vec<(Bytes, StorageValue)>,
         // delete_ranges: Vec<(Bytes, Bytes)>,

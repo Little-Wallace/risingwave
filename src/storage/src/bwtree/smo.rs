@@ -2,15 +2,15 @@ use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
 
+use crate::bwtree::bw_tree_engine::{BwTreeEngine, CheckpointData};
 use crate::bwtree::index_page::{
     IndexPage, IndexPageDelta, IndexPageDeltaChain, SMOType, SonPageInfo,
 };
 use crate::bwtree::leaf_page::LeafPage;
-use crate::bwtree::root_page::{CheckpointData, RootPage};
 use crate::bwtree::{TypedPage, INVALID_PAGE_ID};
 use crate::hummock::HummockResult;
 
-impl RootPage {
+impl BwTreeEngine {
     pub(crate) async fn exec_structure_modification_operation(
         &self,
         new_pages: Vec<Arc<LeafPage>>,

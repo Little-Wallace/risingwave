@@ -6,7 +6,7 @@ use parking_lot::RwLock;
 
 use crate::bwtree::index_page::{IndexPage, IndexPageDeltaChain};
 
-mod bwtree_engine;
+mod bw_tree_engine;
 mod data_iterator;
 mod delta_chain;
 mod delta_hash_table;
@@ -15,11 +15,10 @@ mod leaf_page;
 mod mapping_page;
 mod mapping_table;
 mod page_store;
-mod root_page;
 mod smo;
 mod sorted_data_builder;
 mod sorted_record_block;
-mod uploader;
+mod store;
 
 #[derive(Eq, PartialEq, Clone)]
 pub struct VKey {
