@@ -1,11 +1,11 @@
-use bytes::Bytes;
-use risingwave_hummock_sdk::key::user_key;
-use risingwave_hummock_sdk::KeyComparator;
+use bytes::{Bytes, BytesMut};
+use risingwave_hummock_sdk::key::{user_key, StateTableKey, TableKey};
 
-use crate::bwtree::sorted_data_builder::{BlockBuilder, BlockBuilderOptions};
+use crate::bwtree::sorted_data_builder::BlockBuilder;
 use crate::bwtree::sorted_record_block::{BlockIterator, SortedRecordBlock};
 use crate::bwtree::{PageID, INVALID_PAGE_ID};
-use crate::hummock::CompressionAlgorithm;
+use crate::hummock::value::HummockValue;
+use crate::storage_value::StorageValue;
 
 const RIGHT_SPLIT_SIZE: usize = 32 * 1024;
 
@@ -20,6 +20,29 @@ pub struct LeafPage {
 }
 
 impl LeafPage {
+    pub fn build(
+        pid: PageID,
+        kvs: Vec<(Bytes, StorageValue)>,
+        smallest_user_key: Bytes,
+        largest_user_key: Bytes,
+        epoch: u64,
+    ) -> Self {
+        let mut builder = BlockBuilder::default();
+        let mut raw_key = BytesMut::new();
+        let mut raw_value = BytesMut::new();
+        for (k, v) in kvs {
+            let vk = StateTableKey::new(TableKey(k), epoch);
+            let v: HummockValue<Bytes> = v.into();
+            vk.encode_into(&mut raw_key);
+            v.encode(&mut raw_value);
+            builder.add(raw_key.as_ref(), raw_value.as_ref());
+            raw_key.clear();
+            raw_value.clear();
+        }
+        let raw = SortedRecordBlock::decode(builder.build(), 0).unwrap();
+        LeafPage::new(pid, smallest_user_key, largest_user_key, raw)
+    }
+
     pub fn new(
         id: PageID,
         smallest_key: Bytes,

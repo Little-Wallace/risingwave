@@ -3,14 +3,11 @@ use std::sync::Arc;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
-use risingwave_hummock_sdk::KeyComparator;
 
-use crate::bwtree::leaf_page::LeafPage;
-use crate::bwtree::{PageID, VKey, INVALID_PAGE_ID};
-use crate::hummock::sstable::utils::{get_length_prefixed_slice, put_length_prefixed_slice};
+use crate::bwtree::{PageID, INVALID_PAGE_ID};
+use crate::hummock::sstable::utils::get_length_prefixed_slice;
 
 const MAX_INDEX_PAGE_DELTA_COUNT: usize = 8;
-const MAX_INDEX_PAGE_DELTA_RECORD_COUNT: usize = 64;
 const MAX_INDEX_PAGE_SIZE: usize = 256;
 
 #[derive(Eq, PartialEq, Clone, Copy)]
@@ -256,12 +253,14 @@ pub struct IndexPageDeltaChain {
     base_page: IndexPage,
 }
 
+pub type IndexPageHolder = Arc<RwLock<IndexPageDeltaChain>>;
+
 impl IndexPageDeltaChain {
     pub fn create(
         deltas: Vec<IndexPageDelta>,
         base_page: IndexPage,
         max_commit_epoch: u64,
-    ) -> Arc<RwLock<IndexPageDeltaChain>> {
+    ) -> IndexPageHolder {
         Arc::new(RwLock::new(Self::new(deltas, base_page, max_commit_epoch)))
     }
 

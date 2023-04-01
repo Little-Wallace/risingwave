@@ -27,8 +27,8 @@ impl BwTreeEngineCore {
         for (_, page) in &self.states {
             let root = page.clone();
             let handle = tokio::spawn(async move {
-                /// TODO: we must calculate min snapshot as the safe epoch to delete history version
-                /// safely.
+                // TODO: we must calculate min snapshot as the safe epoch to delete history version
+                // safely.
                 root.flush_dirty_pages_before(epoch, epoch).await
             });
             tasks.push(handle);

@@ -1,28 +1,26 @@
-use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes, BytesMut};
 use itertools::Itertools;
 use risingwave_common::util::epoch::{Epoch, INVALID_EPOCH};
-use risingwave_hummock_sdk::key::{split_key_epoch, user_key, TableKey};
-use risingwave_hummock_sdk::KeyComparator;
+use risingwave_hummock_sdk::key::{split_key_epoch, user_key, StateTableKey};
 
 use crate::bwtree::data_iterator::{MergedDataIterator, MergedSharedBufferIterator};
-use crate::bwtree::index_page::IndexPage;
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::sorted_data_builder::{
     BlockBuilder, BlockBuilderOptions, DEFAULT_RESTART_INTERVAL,
 };
 use crate::bwtree::sorted_record_block::SortedRecordBlock;
-use crate::bwtree::{VKey, INVALID_PAGE_ID};
+use crate::bwtree::INVALID_PAGE_ID;
 use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
-use crate::hummock::value::HummockValue;
 use crate::hummock::CompressionAlgorithm;
 
-const MAX_ALLOW_UPDATE_PERCENT: usize = 40;
 const SPLIT_COUNT_LIMIT: usize = 256;
+#[cfg(not(test))]
 const MAX_LEAF_SIZE_LIMIT: usize = 64 * 1024;
-const SPLIT_LEAF_SIZE: usize = 48 * 1024;
+#[cfg(test)]
+const MAX_LEAF_SIZE_LIMIT: usize = 160;
+
 const SPLIT_LEAF_CAPACITY: usize = 50 * 1024;
 
 pub struct Delta {
@@ -131,23 +129,19 @@ impl DeltaChain {
         self.base_page.as_ref()
     }
 
-    pub fn get(&self, key: &Bytes, epoch: u64) -> Option<Bytes> {
-        let vk = VKey {
-            user_key: key.clone(),
-            epoch,
-        };
-        let mut raw_key = BytesMut::default();
-        vk.encode_to(&mut raw_key);
+    pub fn get(&self, vk: StateTableKey<Bytes>) -> Option<Bytes> {
         for d in self.mem_deltas.iter().rev() {
-            if d.epoch() <= epoch {
-                if let Some(v) = d.get(TableKey(key.as_ref())) {
+            if d.epoch() <= vk.epoch {
+                if let Some(v) = d.get(vk.user_key.to_ref()) {
                     return v.into_user_value();
                 }
             }
         }
+        let mut raw_key = BytesMut::default();
+        vk.encode_into(&mut raw_key);
         let mut iter = self.base_page.iter();
         iter.seek(&raw_key);
-        if iter.is_valid() && user_key(iter.key()).eq(key.as_ref()) {
+        if iter.is_valid() && user_key(iter.key()).eq(vk.user_key.as_ref()) {
             return iter
                 .value()
                 .into_user_value()
@@ -157,11 +151,6 @@ impl DeltaChain {
     }
 
     pub fn apply_to_page(&self, safe_epoch: u64) -> Vec<LeafPage> {
-        let mut builder = BlockBuilder::new(BlockBuilderOptions {
-            capacity: SPLIT_LEAF_CAPACITY,
-            compression_algorithm: CompressionAlgorithm::None,
-            restart_interval: DEFAULT_RESTART_INTERVAL,
-        });
         let mut iters = Vec::with_capacity(self.history_delta.len());
         for delta in &self.history_delta {
             iters.push(delta.raw.iter());
@@ -172,9 +161,14 @@ impl DeltaChain {
         merge_iter.seek_to_first();
         let mut last_user_key = vec![];
         let mut smallest_key = self.base_page.smallest_user_key.clone();
-        let mut data_size = (self.base_page.page_size() + self.update_size());
-        let split_count = data_size / SPLIT_LEAF_SIZE;
+        let mut data_size = self.base_page.page_size() + self.update_size();
+        let split_count = (data_size + MAX_LEAF_SIZE_LIMIT - 1) / MAX_LEAF_SIZE_LIMIT;
         let split_size = data_size / split_count;
+        let mut builder = BlockBuilder::new(BlockBuilderOptions {
+            capacity: split_size + 1024,
+            compression_algorithm: CompressionAlgorithm::None,
+            restart_interval: DEFAULT_RESTART_INTERVAL,
+        });
         while merge_iter.is_valid() {
             let (ukey, mut epoch) = split_key_epoch(merge_iter.key());
             let epoch = epoch.get_u64();
@@ -253,6 +247,157 @@ impl DeltaChain {
                 self.base_page.smallest_user_key.as_ref(),
                 self.base_page.largest_user_key.as_ref(),
             ));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use risingwave_common::catalog::TableId;
+    use risingwave_hummock_sdk::key::{user_key, StateTableKey, TableKey};
+
+    use crate::bwtree::delta_chain::DeltaChain;
+    use crate::bwtree::leaf_page::LeafPage;
+    use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
+    use crate::storage_value::StorageValue;
+
+    fn from_slice_key(key: &[u8], epoch: u64) -> StateTableKey<Bytes> {
+        StateTableKey::new(TableKey(Bytes::copy_from_slice(key)), epoch)
+    }
+
+    fn generate_data(key: &[u8], value: &[u8]) -> (Bytes, StorageValue) {
+        let k = Bytes::copy_from_slice(key);
+        let v = if value.is_empty() {
+            StorageValue::new(None)
+        } else {
+            StorageValue::new(Some(Bytes::copy_from_slice(value)))
+        };
+        (k, v)
+    }
+
+    fn build_shared_buffer_batch(
+        data: Vec<(Bytes, StorageValue)>,
+        epoch: u64,
+    ) -> SharedBufferBatch {
+        let items = SharedBufferBatch::build_shared_buffer_item_batches(data);
+        let sz = SharedBufferBatch::measure_batch_size(&items);
+        SharedBufferBatch::build_shared_buffer_batch(
+            epoch,
+            items,
+            sz,
+            vec![],
+            TableId::new(1),
+            None,
+        )
+    }
+
+    #[test]
+    fn test_leaf_apply() {
+        let data = vec![
+            generate_data(b"aaaa", b"v0"),
+            generate_data(b"bbbb", b"v0"),
+            generate_data(b"cccc", b"v0"),
+            generate_data(b"dddd", b"v0"),
+        ];
+        let base_leaf = LeafPage::build(
+            1,
+            data,
+            Bytes::copy_from_slice(b""),
+            Bytes::copy_from_slice(b"eeee"),
+            1,
+        );
+        let mut delta_chains = DeltaChain::new(Arc::new(base_leaf));
+        assert_eq!(
+            delta_chains.get(from_slice_key(b"aaaa", 1)).unwrap(),
+            Bytes::copy_from_slice(b"v0")
+        );
+        let data1 = vec![generate_data(b"aaaa", b"v1"), generate_data(b"cccc", b"")];
+        delta_chains.ingest(build_shared_buffer_batch(data1, 2));
+
+        assert_eq!(
+            delta_chains.get(from_slice_key(b"aaaa", 1)).unwrap(),
+            Bytes::copy_from_slice(b"v0")
+        );
+        assert_eq!(
+            delta_chains.get(from_slice_key(b"aaaa", 2)).unwrap(),
+            Bytes::copy_from_slice(b"v1")
+        );
+        assert!(delta_chains.get(from_slice_key(b"cccc", 2)).is_none());
+        let data2 = vec![generate_data(b"ccccdddd", b"v2")];
+        delta_chains.ingest(build_shared_buffer_batch(data2, 3));
+        // safe epoch, would delete all MVCC
+        let delta = delta_chains.flush(3).unwrap();
+        delta_chains.commit(delta, 3);
+        let mut new_pages = delta_chains.apply_to_page(3);
+        assert_eq!(new_pages.len(), 1);
+        let page = new_pages.pop().unwrap();
+        let mut iter = page.iter();
+        iter.seek_to_first();
+        let data = vec![
+            generate_data(b"aaaa", b"v1"),
+            generate_data(b"bbbb", b"v0"),
+            generate_data(b"ccccdddd", b"v2"),
+            generate_data(b"dddd", b"v0"),
+        ];
+        let mut idx = 0;
+        while iter.is_valid() {
+            assert_eq!(data[idx].0.as_ref(), user_key(iter.key()));
+            assert_eq!(
+                data[idx].1.user_value.as_ref().unwrap().as_ref(),
+                iter.value().into_user_value().unwrap()
+            );
+            idx += 1;
+            iter.next();
+        }
+        let mut delta_chains = DeltaChain::new(Arc::new(page));
+        let data = vec![
+            generate_data(b"aaaa", b"v3"),
+            generate_data(b"dddd", b"v3"),
+            generate_data(b"eeee", b"v3"),
+            generate_data(b"ffff", b"v3"),
+            generate_data(b"gggg", b"v3"),
+            generate_data(b"hhhh", b"v3"),
+        ];
+        delta_chains.ingest(build_shared_buffer_batch(data, 4));
+        let delta = delta_chains.flush(4).unwrap();
+        delta_chains.commit(delta, 3);
+        let mut new_pages = delta_chains.apply_to_page(4);
+        assert_eq!(new_pages.len(), 2);
+        let mut idx = 0;
+        let mut iter = new_pages[0].iter();
+        iter.seek_to_first();
+        let data = vec![
+            generate_data(b"aaaa", b"v3"),
+            generate_data(b"bbbb", b"v0"),
+            generate_data(b"ccccdddd", b"v2"),
+            generate_data(b"dddd", b"v3"),
+            generate_data(b"eeee", b"v3"),
+            generate_data(b"ffff", b"v3"),
+            generate_data(b"gggg", b"v3"),
+            generate_data(b"hhhh", b"v3"),
+        ];
+        while iter.is_valid() {
+            assert_eq!(data[idx].0.as_ref(), user_key(iter.key()));
+            assert_eq!(
+                data[idx].1.user_value.as_ref().unwrap().as_ref(),
+                iter.value().into_user_value().unwrap()
+            );
+            idx += 1;
+            iter.next();
+        }
+        let mut iter = new_pages[1].iter();
+        iter.seek_to_first();
+        while iter.is_valid() {
+            assert_eq!(data[idx].0.as_ref(), user_key(iter.key()));
+            assert_eq!(
+                data[idx].1.user_value.as_ref().unwrap().as_ref(),
+                iter.value().into_user_value().unwrap()
+            );
+            idx += 1;
+            iter.next();
         }
     }
 }

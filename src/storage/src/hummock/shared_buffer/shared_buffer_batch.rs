@@ -28,7 +28,7 @@ use risingwave_hummock_sdk::key::{FullKey, StateTableKey, TableKey, TableKeyRang
 
 use crate::hummock::iterator::{
     Backward, DeleteRangeIterator, DirectionEnum, Forward, HummockIterator,
-    HummockIteratorDirection, UnorderedMergeIteratorInner,
+    HummockIteratorDirection,
 };
 use crate::hummock::utils::{range_overlap, MemoryTracker};
 use crate::hummock::value::HummockValue;

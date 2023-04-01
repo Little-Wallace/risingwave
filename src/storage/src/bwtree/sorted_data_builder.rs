@@ -3,8 +3,8 @@ use std::io::Write;
 use bytes::{BufMut, Bytes, BytesMut};
 use risingwave_hummock_sdk::KeyComparator;
 
-use super::sorted_record_block::{KeyPrefix, SortedRecordBlock};
-use crate::hummock::sstable::utils::{xxhash64_checksum, xxhash64_verify, CompressionAlgorithm};
+use super::sorted_record_block::KeyPrefix;
+use crate::hummock::sstable::utils::{xxhash64_checksum, CompressionAlgorithm};
 use crate::hummock::HummockError;
 
 pub const SPLIT_LEAF_CAPACITY: usize = 50 * 1024;
@@ -193,5 +193,49 @@ impl BlockBuilder {
     pub fn approximate_len(&self) -> usize {
         // block + restart_points + restart_points.len + compression_algorithm + checksum
         self.buf.len() + 4 * self.restart_points.len() + 4 + 1 + 8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use bytes::BytesMut;
+    use risingwave_hummock_sdk::key::{user_key, StateTableKey, TableKey};
+
+    use crate::bwtree::sorted_data_builder::BlockBuilder;
+    use crate::bwtree::sorted_record_block::SortedRecordBlock;
+    use crate::hummock::value::HummockValue;
+
+    #[test]
+    fn test_data_build() {
+        let mut builder = BlockBuilder::default();
+        let data = [
+            StateTableKey::new(TableKey(b"aa".to_vec()), 1),
+            StateTableKey::new(TableKey(b"bb".to_vec()), 1),
+            StateTableKey::new(TableKey(b"cc".to_vec()), 1),
+        ];
+        for k in &data {
+            let mut raw_key = BytesMut::new();
+            let mut raw_value = BytesMut::new();
+            let v = HummockValue::Put(k.user_key.0.clone());
+            v.encode(&mut raw_value);
+            k.encode_into(&mut raw_key);
+            builder.add(&raw_key, &raw_value);
+            raw_key.clear();
+            raw_value.clear();
+        }
+        let ret = builder.build();
+        let block = SortedRecordBlock::decode(ret, 0).unwrap();
+        let mut iter = block.iter();
+        iter.seek_to_first();
+        let mut idx = 0;
+        while iter.is_valid() {
+            assert_eq!(data[idx].user_key.as_ref(), user_key(iter.key()));
+            assert_eq!(
+                data[idx].user_key.as_ref(),
+                iter.value().into_user_value().unwrap()
+            );
+            iter.next();
+            idx += 1;
+        }
     }
 }

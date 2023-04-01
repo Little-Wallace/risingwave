@@ -4,7 +4,7 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
 
-use crate::bwtree::index_page::{IndexPage, IndexPageDeltaChain};
+use crate::bwtree::index_page::IndexPageDeltaChain;
 
 mod bw_tree_engine;
 mod data_iterator;
@@ -12,7 +12,6 @@ mod delta_chain;
 mod delta_hash_table;
 mod index_page;
 mod leaf_page;
-mod mapping_page;
 mod mapping_table;
 mod page_store;
 mod smo;
@@ -68,7 +67,6 @@ impl From<Bytes> for VKey {
 
 pub type PageID = u64;
 pub const INVALID_PAGE_ID: u64 = 0;
-pub const ROOT_PAGE_ID: u64 = 1;
 
 #[derive(Clone)]
 pub enum TypedPage {

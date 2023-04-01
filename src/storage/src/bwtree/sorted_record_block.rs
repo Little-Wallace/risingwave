@@ -21,7 +21,7 @@ use risingwave_hummock_sdk::KeyComparator;
 use zstd::zstd_safe::WriteBuf;
 use {lz4, zstd};
 
-use crate::hummock::sstable::utils::{xxhash64_checksum, xxhash64_verify, CompressionAlgorithm};
+use crate::hummock::sstable::utils::{xxhash64_verify, CompressionAlgorithm};
 use crate::hummock::value::HummockValue;
 use crate::hummock::{HummockError, HummockResult};
 
@@ -80,7 +80,7 @@ impl SortedRecordBlock {
         let record_count = buf.get_u32_le() as usize;
         let data_len = raw_data_len - n_restarts as usize * 4;
         let mut restart_points = Vec::with_capacity(n_restarts as usize);
-        let mut restart_points_buf = &buf[data_len..raw_data_len];
+        let mut restart_points_buf = &data[data_len..raw_data_len];
         for _ in 0..n_restarts {
             restart_points.push(restart_points_buf.get_u32_le());
         }
@@ -154,6 +154,7 @@ impl SortedRecordBlock {
             let mut count = 0;
             while count < self.record_count / 2 {
                 iter.next();
+                count += 1;
             }
             iter.key.freeze()
         } else {

@@ -370,6 +370,12 @@ impl CopyFromSlice for Bytes {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct TableKey<T: AsRef<[u8]>>(pub T);
 
+impl<T: AsRef<[u8]>> TableKey<T> {
+    pub fn to_ref(&self) -> TableKey<&[u8]> {
+        TableKey(self.0.as_ref())
+    }
+}
+
 impl<T: AsRef<[u8]>> Debug for TableKey<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TableKey")

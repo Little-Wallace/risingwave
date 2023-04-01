@@ -72,7 +72,7 @@ impl PartialOrd for Node {
 
 impl Ord for Node {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.iter.table_key().cmp(&other.iter.table_key())
+        other.iter.table_key().cmp(&self.iter.table_key())
     }
 }
 

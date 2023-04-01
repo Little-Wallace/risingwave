@@ -2,27 +2,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use itertools::Itertools;
 use parking_lot::RwLock;
 use risingwave_common::catalog::TableId;
-use risingwave_common::hash::VirtualNode;
-use risingwave_hummock_sdk::key::{get_vnode_id, TableKey};
+use risingwave_hummock_sdk::key::{get_vnode_id, StateTableKey, TableKey};
 use spin::Mutex;
 
 use crate::bwtree::delta_chain::{Delta, DeltaChain};
-use crate::bwtree::index_page::{
-    IndexPage, IndexPageDelta, IndexPageDeltaChain, PageType, SMOType,
-};
+use crate::bwtree::index_page::{IndexPageHolder, PageType};
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::mapping_table::MappingTable;
 use crate::bwtree::page_store::PageStore;
-use crate::bwtree::sorted_data_builder::BlockBuilder;
-use crate::bwtree::sorted_record_block::SortedRecordBlock;
-use crate::bwtree::{PageID, TypedPage, VKey, INVALID_PAGE_ID};
+use crate::bwtree::{PageID, TypedPage, INVALID_PAGE_ID};
 use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
-use crate::hummock::value::HummockValue;
-use crate::hummock::{HummockResult, SstableObjectIdManager, SstableObjectIdManagerRef};
+use crate::hummock::{HummockResult, SstableObjectIdManagerRef};
 use crate::storage_value::StorageValue;
 use crate::store::WriteOptions;
 
@@ -88,7 +82,7 @@ impl BwTreeEngine {
         let vnodes = self.vnodes.load_full();
         let mut vnodes_change = false;
         for (vnode_id, d) in &kv_pairs.into_iter().group_by(|(k, _)| get_vnode_id(k)) {
-            let mut kvs = d.collect_vec();
+            let kvs = d.collect_vec();
             let (mut pid, mut current_page_type) = match vnodes.get(&vnode_id) {
                 None => {
                     let pid = self
@@ -124,7 +118,7 @@ impl BwTreeEngine {
             let mut last_data = Vec::with_capacity(kvs.len());
             for (key, value) in kvs {
                 let current_page = delta.read();
-                let mut page = current_page.get_page();
+                let page = current_page.get_page();
                 if page.get_right_link() == INVALID_PAGE_ID || key < page.largest_user_key {
                     last_data.push((key, value));
                 } else {
@@ -188,7 +182,7 @@ impl BwTreeEngine {
         let mut updates = self
             .updates
             .lock()
-            .drain_filter(|k, v| *k <= epoch)
+            .drain_filter(|k, _v| *k <= epoch)
             .collect_vec();
         updates.sort_by(|a, b| a.0.cmp(&b.0));
         let mut vnodes = HashMap::new();
@@ -222,7 +216,7 @@ impl BwTreeEngine {
             };
             dirty_page.write().commit(delta.clone(), epoch);
             if dirty_page.read().update_size() > MAX_UPDATE_LEAF_SIZE {
-                let mut new_pages = dirty_page.read().apply_to_page(safe_epoch);
+                let new_pages = dirty_page.read().apply_to_page(safe_epoch);
                 let mut new_pid = INVALID_PAGE_ID;
                 let page_count = new_pages.len();
                 let mut leaf_pages = vec![];
@@ -246,6 +240,14 @@ impl BwTreeEngine {
                             }
                         }
                     } else {
+                        // TODO: we can not set right link tree for the origin page (the first one,
+                        // we use P to point it). we shall split delta at first and then register
+                        // new right pages, finally set right link for the origin page.
+                        // There would be a middle state which both read-thread and write-state
+                        // would see. We would record split-key and origin page id in all right
+                        // pages. All read-request would search P at first.
+                        // And then the P would register right link to right pages. Finally P would
+                        // move all delta to rest pages and cancel their middle-state.
                         right_buffer = dirty_page.write().set_new_page(p.clone());
                     }
                     self.page_mapping.insert_page(p.get_page_id(), p.clone());
@@ -266,7 +268,7 @@ impl BwTreeEngine {
     async fn search_index_page(
         &self,
         table_key: TableKey<Bytes>,
-        index_page: &Arc<RwLock<IndexPageDeltaChain>>,
+        index_page: &IndexPageHolder,
         epoch: u64,
     ) -> HummockResult<Option<Bytes>> {
         let page = index_page.read();
@@ -274,6 +276,7 @@ impl BwTreeEngine {
         let mut pinfo = page.get_page_in_range(&table_key);
         while pinfo.1 != PageType::Leaf {
             let next_page = self.page_mapping.get_index_page(&pinfo.0);
+            parent_link = pinfo.0;
             pinfo = next_page.read().get_page_in_range(&table_key);
         }
         self.search_data_page(table_key, pinfo.0, parent_link, epoch)
@@ -284,36 +287,21 @@ impl BwTreeEngine {
         &self,
         table_key: TableKey<Bytes>,
         mut leaf_page_id: PageID,
-        mut parent_link: PageID,
+        parent_link: PageID,
         epoch: u64,
     ) -> HummockResult<Option<Bytes>> {
+        let vk = StateTableKey::new(table_key, epoch);
         loop {
             // TODO: do not create delta-chains if there is only base page data in tree.
-            let delta = match self.page_mapping.get_data_chains(&leaf_page_id) {
-                None => {
-                    let mut raw_key = BytesMut::new();
-                    let vk = VKey {
-                        user_key: table_key.0,
-                        epoch,
-                    };
-                    vk.encode_to(&mut raw_key);
-                    let d = match self.page_mapping.get_leaf_page(leaf_page_id) {
-                        None => self.get_leaf_page_delta(leaf_page_id, parent_link).await?,
-                        Some(page) => {
-                            return Ok(page.value().get(&raw_key));
-                        }
-                    };
-                    return Ok(d.read().get(&vk.user_key, epoch));
-                }
-                Some(d) => d,
-            };
+            let delta = self.get_leaf_page_delta(leaf_page_id, parent_link).await?;
             let d = delta.read();
             let next_link = d.get_page_ref().get_right_link();
-            if next_link != INVALID_PAGE_ID && d.get_page_ref().largest_user_key.le(&table_key.0) {
+            if next_link != INVALID_PAGE_ID && d.get_page_ref().largest_user_key.le(&vk.user_key.0)
+            {
                 leaf_page_id = next_link;
                 continue;
             }
-            return Ok(d.get(&table_key, epoch));
+            return Ok(d.get(vk));
         }
     }
 
@@ -325,18 +313,7 @@ impl BwTreeEngine {
         epoch: u64,
     ) -> HummockResult<PageID> {
         let pid = self.get_new_page_id().await?;
-        let mut builder = BlockBuilder::default();
-        let mut raw_key = BytesMut::new();
-        let mut raw_value = BytesMut::new();
-        for (k, v) in kvs {
-            let vk = VKey { user_key: k, epoch };
-            let v: HummockValue<Bytes> = v.into();
-            vk.encode_to(&mut raw_key);
-            v.encode(&mut raw_value);
-            builder.add(raw_key.as_ref(), raw_value.as_ref());
-        }
-        let raw = SortedRecordBlock::decode(builder.build(), 0).unwrap();
-        let mut page = LeafPage::new(pid, smallest_user_key, largest_user_key, raw);
+        let page = LeafPage::build(pid, kvs, smallest_user_key, largest_user_key, epoch);
         self.page_mapping.insert_page(pid, Arc::new(page));
         Ok(pid)
     }
@@ -395,7 +372,7 @@ impl BwTreeEngine {
     fn find_first_page_in_subtree(&self, page_id: PageID, target_depth: usize) -> (PageID, Bytes) {
         let mut current = page_id;
         loop {
-            let parent_page = self.page_mapping.get_index_page(&page_id);
+            let parent_page = self.page_mapping.get_index_page(&current);
             let page = parent_page.read();
             let height = page.get_base_page().get_height();
             let (left_smallest, left_link) = page.get_base_page().get_left_page_info();

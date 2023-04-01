@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use parking_lot::RwLock;
-use risingwave_common::cache::{CacheableEntry, LookupResponse, LruCache, LruCacheEventListener};
+use risingwave_common::cache::{CacheableEntry, LruCache};
 
 use crate::bwtree::delta_chain::DeltaChain;
-use crate::bwtree::index_page::{IndexPage, IndexPageDeltaChain};
+use crate::bwtree::index_page::IndexPageDeltaChain;
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::PageID;
 
