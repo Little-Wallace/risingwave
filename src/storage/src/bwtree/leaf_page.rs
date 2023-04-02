@@ -80,10 +80,12 @@ impl LeafPage {
         Bytes::copy_from_slice(user_key(iter.key()))
     }
 
-    pub fn get(&self, key: &[u8]) -> Option<Bytes> {
+    pub fn get(&self, key: StateTableKey<Bytes>) -> Option<Bytes> {
+        let mut raw_key = BytesMut::default();
+        key.encode_into(&mut raw_key);
         let mut iter = BlockIterator::new(&self.raw);
-        iter.seek(key);
-        if iter.is_valid() && user_key(iter.key()).eq(user_key(key)) {
+        iter.seek(&raw_key);
+        if iter.is_valid() && user_key(iter.key()).eq(key.user_key.as_ref()) {
             let v = iter.value().to_bytes();
             return v.into_user_value();
         }
@@ -104,5 +106,12 @@ impl LeafPage {
 
     pub fn get_middle_key(&self) -> Bytes {
         self.raw.get_middle_key()
+    }
+
+    pub fn check_valid_read(&self, user_key: &Bytes) -> bool {
+        if self.right_link != INVALID_PAGE_ID && self.largest_user_key.le(user_key) {
+            return false;
+        }
+        true
     }
 }

@@ -2,8 +2,7 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 use itertools::Itertools;
-use risingwave_common::util::epoch::{Epoch, INVALID_EPOCH};
-use risingwave_hummock_sdk::key::{split_key_epoch, user_key, StateTableKey};
+use risingwave_hummock_sdk::key::{split_key_epoch, StateTableKey};
 
 use crate::bwtree::data_iterator::{MergedDataIterator, MergedSharedBufferIterator};
 use crate::bwtree::leaf_page::LeafPage;
@@ -34,6 +33,8 @@ pub struct DeltaChain {
     current_data_size: usize,
     mem_deltas: Vec<SharedBufferBatch>,
     history_delta: Vec<Arc<Delta>>,
+    // TODO: replace it with PageID because we do not hope every write operation fetch the whole
+    // page from remote-storage.
     base_page: Arc<LeafPage>,
 }
 
@@ -137,17 +138,7 @@ impl DeltaChain {
                 }
             }
         }
-        let mut raw_key = BytesMut::default();
-        vk.encode_into(&mut raw_key);
-        let mut iter = self.base_page.iter();
-        iter.seek(&raw_key);
-        if iter.is_valid() && user_key(iter.key()).eq(vk.user_key.as_ref()) {
-            return iter
-                .value()
-                .into_user_value()
-                .map(|v| Bytes::copy_from_slice(v));
-        }
-        None
+        self.base_page.get(vk)
     }
 
     pub fn apply_to_page(&self, safe_epoch: u64) -> Vec<LeafPage> {

@@ -120,18 +120,6 @@ impl BlockBuilder {
         self.buf.is_empty()
     }
 
-    pub fn clear(&mut self) {
-        self.buf.clear();
-        self.restart_points.clear();
-        self.last_key.clear();
-        self.entry_count = 0;
-    }
-
-    /// Calculate block size without compression.
-    pub fn uncompressed_block_size(&mut self) -> usize {
-        self.buf.len() + (self.restart_points.len() + 1) * std::mem::size_of::<u32>()
-    }
-
     /// Finishes building block.
     ///
     /// # Format
