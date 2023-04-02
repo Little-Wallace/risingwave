@@ -13,11 +13,14 @@ mod delta_hash_table;
 mod index_page;
 mod leaf_page;
 mod mapping_table;
+mod page_id_generator;
 mod page_store;
 mod smo;
 mod sorted_data_builder;
 mod sorted_record_block;
 mod store;
+#[cfg(test)]
+mod test_utils;
 
 #[derive(Eq, PartialEq, Clone)]
 pub struct VKey {
@@ -65,11 +68,11 @@ impl From<Bytes> for VKey {
     }
 }
 
-pub type PageID = u64;
+pub type PageId = u64;
 pub const INVALID_PAGE_ID: u64 = 0;
 
 #[derive(Clone)]
 pub enum TypedPage {
     Index(Arc<RwLock<IndexPageDeltaChain>>),
-    DataPage(PageID),
+    DataPage(PageId),
 }

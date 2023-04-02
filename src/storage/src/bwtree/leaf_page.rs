@@ -3,7 +3,8 @@ use risingwave_hummock_sdk::key::{user_key, StateTableKey, TableKey};
 
 use crate::bwtree::sorted_data_builder::BlockBuilder;
 use crate::bwtree::sorted_record_block::{BlockIterator, SortedRecordBlock};
-use crate::bwtree::{PageID, INVALID_PAGE_ID};
+use crate::bwtree::{PageId, INVALID_PAGE_ID};
+use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::value::HummockValue;
 use crate::storage_value::StorageValue;
 
@@ -11,9 +12,9 @@ const RIGHT_SPLIT_SIZE: usize = 32 * 1024;
 
 pub struct LeafPage {
     raw: SortedRecordBlock,
-    id: PageID,
-    right_link: PageID,
-    pub parent_link: PageID,
+    id: PageId,
+    right_link: PageId,
+    pub parent_link: PageId,
     pub smallest_user_key: Bytes,
     // The largest user key always equals the smallest user key of right-link page.
     pub largest_user_key: Bytes,
@@ -21,7 +22,7 @@ pub struct LeafPage {
 
 impl LeafPage {
     pub fn build(
-        pid: PageID,
+        pid: PageId,
         kvs: Vec<(Bytes, StorageValue)>,
         smallest_user_key: Bytes,
         largest_user_key: Bytes,
@@ -44,7 +45,7 @@ impl LeafPage {
     }
 
     pub fn new(
-        id: PageID,
+        id: PageId,
         smallest_key: Bytes,
         largest_key: Bytes,
         raw: SortedRecordBlock,
@@ -59,19 +60,19 @@ impl LeafPage {
         }
     }
 
-    pub fn set_page_id(&mut self, pid: PageID) {
+    pub fn set_page_id(&mut self, pid: PageId) {
         self.id = pid;
     }
 
-    pub fn get_right_link(&self) -> PageID {
+    pub fn get_right_link(&self) -> PageId {
         self.right_link
     }
 
-    pub fn set_right_link(&mut self, right_link: PageID) {
+    pub fn set_right_link(&mut self, right_link: PageId) {
         self.right_link = right_link;
     }
 
-    pub fn set_parent_link(&mut self, parent_link: PageID) {
+    pub fn set_parent_link(&mut self, parent_link: PageId) {
         self.parent_link = parent_link;
     }
 
@@ -100,7 +101,7 @@ impl LeafPage {
         self.raw.size()
     }
 
-    pub fn get_page_id(&self) -> PageID {
+    pub fn get_page_id(&self) -> PageId {
         self.id
     }
 
@@ -113,5 +114,20 @@ impl LeafPage {
             return false;
         }
         true
+    }
+
+    pub fn fetch_overlap_mem_delta(&self, batches: &[SharedBufferBatch]) -> Vec<SharedBufferBatch> {
+        let mut mem_deltas = vec![];
+        for batch in batches {
+            if self.smallest_user_key.as_ref().le(batch.end_table_key().0)
+                && self.largest_user_key.as_ref().gt(batch.start_table_key().0)
+            {
+                mem_deltas.push(batch.copy_batch_between_range(
+                    self.smallest_user_key.as_ref(),
+                    self.largest_user_key.as_ref(),
+                ));
+            }
+        }
+        mem_deltas
     }
 }

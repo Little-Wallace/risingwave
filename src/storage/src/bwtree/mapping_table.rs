@@ -7,47 +7,55 @@ use risingwave_common::cache::{CacheableEntry, LruCache};
 use crate::bwtree::delta_chain::DeltaChain;
 use crate::bwtree::index_page::IndexPageDeltaChain;
 use crate::bwtree::leaf_page::LeafPage;
-use crate::bwtree::PageID;
+use crate::bwtree::PageId;
 
-pub type PageHolder = CacheableEntry<PageID, Arc<LeafPage>>;
+pub type PageHolder = CacheableEntry<PageId, Arc<LeafPage>>;
 
 pub struct MappingTable {
-    leaf_pages: Arc<LruCache<PageID, Arc<LeafPage>>>,
+    leaf_pages: Arc<LruCache<PageId, Arc<LeafPage>>>,
     // TODO: store index-page in lru-cache to avoid use too much memory.
-    index_pages: RwLock<HashMap<PageID, Arc<RwLock<IndexPageDeltaChain>>>>,
+    index_pages: RwLock<HashMap<PageId, Arc<RwLock<IndexPageDeltaChain>>>>,
     /// TODO: replace it with concurrent hash table.
-    delta_chains: Arc<RwLock<HashMap<PageID, Arc<RwLock<DeltaChain>>>>>,
+    delta_chains: Arc<RwLock<HashMap<PageId, Arc<RwLock<DeltaChain>>>>>,
 }
 
 impl MappingTable {
-    pub fn get_data_chains(&self, pid: &PageID) -> Option<Arc<RwLock<DeltaChain>>> {
+    pub fn new(shard_bits: usize, capacity: usize) -> Self {
+        Self {
+            leaf_pages: Arc::new(LruCache::new(shard_bits, capacity)),
+            index_pages: RwLock::new(HashMap::default()),
+            delta_chains: Arc::new(RwLock::new(HashMap::default())),
+        }
+    }
+
+    pub fn get_data_chains(&self, pid: &PageId) -> Option<Arc<RwLock<DeltaChain>>> {
         self.delta_chains.read().get(pid).cloned()
     }
 
-    pub fn remove_delta_chains(&self, pid: &PageID) {
+    pub fn remove_delta_chains(&self, pid: &PageId) {
         self.delta_chains.write().remove(pid);
     }
 
-    pub fn get_leaf_page(&self, pid: PageID) -> Option<PageHolder> {
+    pub fn get_leaf_page(&self, pid: PageId) -> Option<PageHolder> {
         self.leaf_pages.lookup(pid, &pid)
     }
 
-    pub fn insert_page(&self, pid: PageID, page: Arc<LeafPage>) {
+    pub fn insert_page(&self, pid: PageId, page: Arc<LeafPage>) {
         self.leaf_pages.insert(pid, pid, page.page_size(), page);
     }
 
-    pub fn insert_delta(&self, pid: PageID, chain: DeltaChain) {
+    pub fn insert_delta(&self, pid: PageId, chain: DeltaChain) {
         self.delta_chains
             .write()
             .insert(pid, Arc::new(RwLock::new(chain)));
     }
 
     // we assume that all index-page are in memory
-    pub fn get_index_page(&self, pid: &PageID) -> Arc<RwLock<IndexPageDeltaChain>> {
+    pub fn get_index_page(&self, pid: &PageId) -> Arc<RwLock<IndexPageDeltaChain>> {
         self.index_pages.read().get(pid).unwrap().clone()
     }
 
-    pub fn insert_index_delta(&self, pid: PageID, chain: Arc<RwLock<IndexPageDeltaChain>>) {
+    pub fn insert_index_delta(&self, pid: PageId, chain: Arc<RwLock<IndexPageDeltaChain>>) {
         self.index_pages.write().insert(pid, chain);
     }
 }

@@ -14,12 +14,6 @@ use crate::bwtree::INVALID_PAGE_ID;
 use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::CompressionAlgorithm;
 
-const SPLIT_COUNT_LIMIT: usize = 256;
-#[cfg(not(test))]
-const MAX_LEAF_SIZE_LIMIT: usize = 64 * 1024;
-#[cfg(test)]
-const MAX_LEAF_SIZE_LIMIT: usize = 160;
-
 const SPLIT_LEAF_CAPACITY: usize = 50 * 1024;
 
 pub struct Delta {
@@ -33,7 +27,7 @@ pub struct DeltaChain {
     current_data_size: usize,
     mem_deltas: Vec<SharedBufferBatch>,
     history_delta: Vec<Arc<Delta>>,
-    // TODO: replace it with PageID because we do not hope every write operation fetch the whole
+    // TODO: replace it with PageId because we do not hope every write operation fetch the whole
     // page from remote-storage.
     base_page: Arc<LeafPage>,
 }
@@ -141,7 +135,7 @@ impl DeltaChain {
         self.base_page.get(vk)
     }
 
-    pub fn apply_to_page(&self, safe_epoch: u64) -> Vec<LeafPage> {
+    pub fn apply_to_page(&self, max_split_size: usize, safe_epoch: u64) -> Vec<LeafPage> {
         let mut iters = Vec::with_capacity(self.history_delta.len());
         for delta in &self.history_delta {
             iters.push(delta.raw.iter());
@@ -153,7 +147,7 @@ impl DeltaChain {
         let mut last_user_key = vec![];
         let mut smallest_key = self.base_page.smallest_user_key.clone();
         let mut data_size = self.base_page.page_size() + self.update_size();
-        let split_count = (data_size + MAX_LEAF_SIZE_LIMIT - 1) / MAX_LEAF_SIZE_LIMIT;
+        let split_count = (data_size + max_split_size - 1) / max_split_size;
         let split_size = data_size / split_count;
         let mut builder = BlockBuilder::new(BlockBuilderOptions {
             capacity: split_size + 1024,
@@ -202,43 +196,36 @@ impl DeltaChain {
         pages
     }
 
-    pub fn set_new_page(&mut self, page: Arc<LeafPage>) -> Vec<SharedBufferBatch> {
+    pub fn get_shared_memory_buffer(&self) -> Vec<SharedBufferBatch> {
+        self.mem_deltas.clone()
+    }
+
+    pub fn set_new_page(&mut self, page: Arc<LeafPage>) {
         self.history_delta.clear();
         // the structure of tree does not change
         if self.base_page.get_right_link() == page.get_right_link() {
-            return vec![];
+            self.base_page = page;
+            return;
         }
         let batches = self
             .mem_deltas
             .drain_filter(|batch| {
                 page.smallest_user_key
                     .as_ref()
-                    .le(batch.start_table_key().0)
-                    && page.largest_user_key.as_ref().gt(batch.end_table_key().0)
+                    .gt(batch.start_table_key().0)
+                    || page.largest_user_key.as_ref().le(batch.end_table_key().0)
             })
             .collect_vec();
-        for batch in &batches {
-            if page.smallest_user_key.as_ref().le(batch.end_table_key().0)
-                && page.largest_user_key.as_ref().gt(batch.start_table_key().0)
-            {
-                self.mem_deltas.push(batch.copy_batch_between_range(
-                    page.smallest_user_key.as_ref(),
-                    page.largest_user_key.as_ref(),
-                ));
-            }
-        }
+        self.mem_deltas
+            .extend(page.fetch_overlap_mem_delta(&batches));
+        self.mem_deltas.sort_by_key(|batch| batch.epoch());
         assert_eq!(self.base_page.get_page_id(), page.get_page_id());
         self.base_page = page;
-        batches
     }
 
-    pub fn append_delta_from_parent_page(&mut self, batches: &[SharedBufferBatch]) {
-        for batch in batches {
-            self.mem_deltas.push(batch.copy_batch_between_range(
-                self.base_page.smallest_user_key.as_ref(),
-                self.base_page.largest_user_key.as_ref(),
-            ));
-        }
+    pub fn append_delta_from_parent_page(&mut self, batches: Vec<SharedBufferBatch>) {
+        self.mem_deltas.extend(batches);
+        self.mem_deltas.sort_by_key(|batch| batch.epoch());
     }
 }
 
@@ -247,43 +234,11 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use risingwave_common::catalog::TableId;
-    use risingwave_hummock_sdk::key::{user_key, StateTableKey, TableKey};
+    use risingwave_hummock_sdk::key::{user_key, TableKey};
 
     use crate::bwtree::delta_chain::DeltaChain;
     use crate::bwtree::leaf_page::LeafPage;
-    use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
-    use crate::storage_value::StorageValue;
-
-    fn from_slice_key(key: &[u8], epoch: u64) -> StateTableKey<Bytes> {
-        StateTableKey::new(TableKey(Bytes::copy_from_slice(key)), epoch)
-    }
-
-    fn generate_data(key: &[u8], value: &[u8]) -> (Bytes, StorageValue) {
-        let k = Bytes::copy_from_slice(key);
-        let v = if value.is_empty() {
-            StorageValue::new(None)
-        } else {
-            StorageValue::new(Some(Bytes::copy_from_slice(value)))
-        };
-        (k, v)
-    }
-
-    fn build_shared_buffer_batch(
-        data: Vec<(Bytes, StorageValue)>,
-        epoch: u64,
-    ) -> SharedBufferBatch {
-        let items = SharedBufferBatch::build_shared_buffer_item_batches(data);
-        let sz = SharedBufferBatch::measure_batch_size(&items);
-        SharedBufferBatch::build_shared_buffer_batch(
-            epoch,
-            items,
-            sz,
-            vec![],
-            TableId::new(1),
-            None,
-        )
-    }
+    use crate::bwtree::test_utils::{build_shared_buffer_batch, from_slice_key, generate_data};
 
     #[test]
     fn test_leaf_apply() {
@@ -322,7 +277,7 @@ mod tests {
         // safe epoch, would delete all MVCC
         let delta = delta_chains.flush(3).unwrap();
         delta_chains.commit(delta, 3);
-        let mut new_pages = delta_chains.apply_to_page(3);
+        let mut new_pages = delta_chains.apply_to_page(160, 3);
         assert_eq!(new_pages.len(), 1);
         let page = new_pages.pop().unwrap();
         let mut iter = page.iter();
@@ -355,7 +310,7 @@ mod tests {
         delta_chains.ingest(build_shared_buffer_batch(data, 4));
         let delta = delta_chains.flush(4).unwrap();
         delta_chains.commit(delta, 3);
-        let mut new_pages = delta_chains.apply_to_page(4);
+        let mut new_pages = delta_chains.apply_to_page(160, 4);
         assert_eq!(new_pages.len(), 2);
         let mut idx = 0;
         let mut iter = new_pages[0].iter();

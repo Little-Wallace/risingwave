@@ -4,11 +4,8 @@ use std::sync::Arc;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
 
-use crate::bwtree::{PageID, INVALID_PAGE_ID};
+use crate::bwtree::{PageId, INVALID_PAGE_ID};
 use crate::hummock::sstable::utils::get_length_prefixed_slice;
-
-const MAX_INDEX_PAGE_DELTA_COUNT: usize = 8;
-const MAX_INDEX_PAGE_SIZE: usize = 256;
 
 #[derive(Eq, PartialEq, Clone, Copy)]
 pub enum PageType {
@@ -18,7 +15,7 @@ pub enum PageType {
 
 #[derive(Eq, PartialEq, Clone)]
 pub struct SonPageInfo {
-    pub page_id: PageID,
+    pub page_id: PageId,
     // table_key, do not include epoch.
     pub smallest_key: Bytes,
 }
@@ -50,14 +47,14 @@ pub struct TreeInfoData {
 ///  TODO: we can store common prefix for the whole sub-tree and only store suffix in sub-tree. And
 /// this BTreeMap could be replace to concurrent-skiplist for batch-query.
 pub struct IndexPage {
-    pid: PageID,
-    sub_tree: BTreeMap<Bytes, PageID>,
+    pid: PageId,
+    sub_tree: BTreeMap<Bytes, PageId>,
     epoch: u64,
 
     // Do not encode these fields because we can recover it from parent info.
     height: usize,
-    right_link: PageID,
-    parent_link: PageID,
+    right_link: PageId,
+    parent_link: PageId,
     smallest_user_key: Bytes,
 }
 
@@ -81,8 +78,8 @@ impl TreeInfoData {
 
 impl IndexPage {
     pub fn new(
-        pid: PageID,
-        parent_link: PageID,
+        pid: PageId,
+        parent_link: PageId,
         smallest_user_key: Bytes,
         height: usize,
     ) -> IndexPage {
@@ -144,7 +141,7 @@ impl IndexPage {
         (left, Bytes::new())
     }
 
-    pub fn get_page_in_range(&self, key: &Bytes) -> (PageID, PageType) {
+    pub fn get_page_in_range(&self, key: &Bytes) -> (PageId, PageType) {
         let mut index = self.sub_tree.range((
             std::ops::Bound::Included(key.clone()),
             std::ops::Bound::Unbounded,
@@ -158,7 +155,7 @@ impl IndexPage {
         (*page_idx, ptype)
     }
 
-    pub fn get_right_link_in_range(&self, key: &Bytes) -> PageID {
+    pub fn get_right_link_in_range(&self, key: &Bytes) -> PageId {
         let mut index = self.sub_tree.range((
             std::ops::Bound::Included(key.clone()),
             std::ops::Bound::Unbounded,
@@ -170,24 +167,24 @@ impl IndexPage {
         INVALID_PAGE_ID
     }
 
-    pub fn get_left_page_info(&self) -> (Bytes, PageID) {
+    pub fn get_left_page_info(&self) -> (Bytes, PageId) {
         let (k, p) = self.sub_tree.first_key_value().unwrap();
         (k.clone(), *p)
     }
 
-    pub fn get_right_link(&self) -> PageID {
+    pub fn get_right_link(&self) -> PageId {
         self.right_link
     }
 
-    pub fn get_parent_link(&self) -> PageID {
+    pub fn get_parent_link(&self) -> PageId {
         self.parent_link
     }
 
-    pub fn set_right_link(&mut self, pid: PageID) {
+    pub fn set_right_link(&mut self, pid: PageId) {
         self.right_link = pid;
     }
 
-    pub fn set_parent_link(&mut self, pid: PageID) {
+    pub fn set_parent_link(&mut self, pid: PageId) {
         self.parent_link = pid;
     }
 
@@ -203,11 +200,11 @@ impl IndexPage {
         self.height
     }
 
-    pub fn insert_page(&mut self, key: Bytes, pid: PageID) {
+    pub fn insert_page(&mut self, key: Bytes, pid: PageId) {
         self.sub_tree.insert(key, pid);
     }
 
-    pub fn get_page_id(&self) -> PageID {
+    pub fn get_page_id(&self) -> PageId {
         self.pid
     }
 
@@ -215,7 +212,7 @@ impl IndexPage {
         self.sub_tree.remove(key);
     }
 
-    pub fn set_page_id(&mut self, pid: PageID) {
+    pub fn set_page_id(&mut self, pid: PageId) {
         self.pid = pid;
     }
 }
@@ -234,7 +231,7 @@ pub struct IndexPageDelta {
 }
 
 impl IndexPageDelta {
-    pub fn new(smo: SMOType, page_id: PageID, epoch: u64, smallest_key: Bytes) -> Self {
+    pub fn new(smo: SMOType, page_id: PageId, epoch: u64, smallest_key: Bytes) -> Self {
         Self {
             son: SonPageInfo {
                 page_id,
@@ -287,13 +284,13 @@ impl IndexPageDeltaChain {
 
     /// Query sub-page by user-key. Because we would store all MVCC version of the same key in one
     ///  leaf page.
-    pub fn get_page_in_range(&self, key: &Bytes) -> (PageID, PageType) {
+    pub fn get_page_in_range(&self, key: &Bytes) -> (PageId, PageType) {
         self.base_page.get_page_in_range(key)
     }
 
     /// Query sub-page by user-key. Because we would store all MVCC version of the same key in one
     ///  leaf page.
-    pub fn get_right_link_in_range(&self, key: &Bytes) -> PageID {
+    pub fn get_right_link_in_range(&self, key: &Bytes) -> PageId {
         self.base_page.get_right_link_in_range(key)
     }
 
@@ -308,12 +305,12 @@ impl IndexPageDeltaChain {
         self.uncommited_delta.push(delta);
     }
 
-    pub fn shall_reconcile(&self) -> bool {
-        self.immutable_delta_count > MAX_INDEX_PAGE_DELTA_COUNT
+    pub fn shall_reconcile(&self, max_reconcile_count: usize) -> bool {
+        self.immutable_delta_count > max_reconcile_count
     }
 
-    pub fn shall_split(&self) -> bool {
-        self.base_page.sub_tree.len() > MAX_INDEX_PAGE_SIZE
+    pub fn shall_split(&self, max_split_count: usize) -> bool {
+        self.base_page.sub_tree.len() > max_split_count
     }
 
     pub fn set_page(&mut self, commit_epoch: u64, page: IndexPage) {
@@ -333,7 +330,7 @@ impl IndexPageDeltaChain {
         data
     }
 
-    pub fn get_base_page_id(&self) -> PageID {
+    pub fn get_base_page_id(&self) -> PageId {
         self.base_page.pid
     }
 
@@ -341,19 +338,17 @@ impl IndexPageDeltaChain {
         &self.base_page
     }
 
-    pub fn get_right_link(&self) -> PageID {
+    pub fn get_right_link(&self) -> PageId {
         self.base_page.right_link
     }
 
-    pub fn get_parent_link(&self) -> PageID {
+    pub fn get_parent_link(&self) -> PageId {
         self.base_page.parent_link
     }
 
     pub fn split_to_pages(&self, commit_epoch: u64) -> Vec<IndexPage> {
         let mut pages = vec![];
-        let split_size = MAX_INDEX_PAGE_SIZE / 2;
-        let split_page_count = self.base_page.sub_tree.len() / split_size;
-        let split_size = self.base_page.sub_tree.len() / split_page_count;
+        let split_size = self.base_page.sub_tree.len() / 2;
         let mut sub_tree = BTreeMap::default();
         let mut smallest_user_key = self.base_page.smallest_user_key.clone();
         for (smallest_key, pid) in &self.base_page.sub_tree {

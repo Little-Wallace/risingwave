@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::ops::Range;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
