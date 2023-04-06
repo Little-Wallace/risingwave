@@ -37,7 +37,7 @@ impl SonPageInfo {
     }
 }
 
-pub struct TreeInfoData {
+struct TreeInfoData {
     nodes: Vec<SonPageInfo>,
 }
 

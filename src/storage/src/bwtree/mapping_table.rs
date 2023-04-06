@@ -44,10 +44,10 @@ impl MappingTable {
         self.leaf_pages.insert(pid, pid, page.page_size(), page);
     }
 
-    pub fn insert_delta(&self, pid: PageId, chain: DeltaChain) {
-        self.delta_chains
-            .write()
-            .insert(pid, Arc::new(RwLock::new(chain)));
+    pub fn insert_delta(&self, pid: PageId, chain: DeltaChain) -> Arc<RwLock<DeltaChain>> {
+        let delta = Arc::new(RwLock::new(chain));
+        self.delta_chains.write().insert(pid, delta.clone());
+        delta
     }
 
     // we assume that all index-page are in memory

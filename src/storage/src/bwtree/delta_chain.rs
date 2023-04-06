@@ -105,13 +105,6 @@ impl DeltaChain {
             .sum::<usize>()
     }
 
-    pub fn buffer_size(&self) -> usize {
-        self.mem_deltas
-            .iter()
-            .map(|delta| delta.size())
-            .sum::<usize>()
-    }
-
     pub fn update_count(&self) -> usize {
         self.history_delta.len()
     }
@@ -234,7 +227,7 @@ mod tests {
     use std::sync::Arc;
 
     use bytes::Bytes;
-    use risingwave_hummock_sdk::key::{user_key, TableKey};
+    use risingwave_hummock_sdk::key::user_key;
 
     use crate::bwtree::delta_chain::DeltaChain;
     use crate::bwtree::leaf_page::LeafPage;

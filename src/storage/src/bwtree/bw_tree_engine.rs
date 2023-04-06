@@ -158,6 +158,7 @@ impl BwTreeEngine {
                 pid = next_pid;
                 current_page_type = next_type;
             }
+            println!("find leaf page: {}", pid);
             let mut delta = match self.page_mapping.get_data_chains(&pid) {
                 Some(delta) => delta,
                 None => {
@@ -321,8 +322,9 @@ impl BwTreeEngine {
                     Some(page) => page.value().clone(),
                     None => self.get_leaf_page(pid, parent_page_id).await?,
                 };
+                println!("create new delta");
                 let delta = DeltaChain::new(page);
-                Ok(Arc::new(RwLock::new(delta)))
+                Ok(self.page_mapping.insert_delta(pid, delta))
             }
         }
     }
@@ -383,6 +385,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    use bytes::BytesMut;
     use risingwave_common::catalog::TableId;
     use risingwave_hummock_sdk::key::TableKey;
 
@@ -390,9 +393,7 @@ mod tests {
     use crate::bwtree::mapping_table::MappingTable;
     use crate::bwtree::page_id_generator::LocalPageIdGenerator;
     use crate::bwtree::page_store::PageStore;
-    use crate::bwtree::test_utils::{
-        generate_data, generate_data_with_partition, get_key_with_partition,
-    };
+    use crate::bwtree::test_utils::{generate_data_with_partition, get_key_with_partition};
     use crate::store::WriteOptions;
 
     #[tokio::test]
@@ -404,9 +405,10 @@ mod tests {
             PageStore {},
             EngineOptions {
                 leaf_split_size: 150,
-                index_split_count: 6,
                 leaf_reconcile_size: 50,
                 leaf_min_merge_size: 50,
+                index_reconcile_count: 2,
+                index_split_count: 6,
             },
         );
         let mut write_options = WriteOptions {
@@ -417,7 +419,7 @@ mod tests {
             .flush(
                 vec![
                     generate_data_with_partition(0, b"abcde", b"v0"),
-                    generate_data_with_partition(0, b"abcdef", b"v0"),
+                    generate_data_with_partition(0, b"abcdf", b"v0"),
                 ],
                 write_options.clone(),
             )
@@ -429,5 +431,31 @@ mod tests {
             .unwrap();
         assert!(v.is_some());
         assert_eq!(v.unwrap().as_ref(), b"v0");
+        println!("=================second=========");
+        write_options.epoch = 2;
+        engine
+            .flush(
+                vec![generate_data_with_partition(0, b"abcdfg", b"v1")],
+                write_options.clone(),
+            )
+            .await
+            .unwrap();
+        let v = engine
+            .get(TableKey(get_key_with_partition(0, b"abcdfg")), 2)
+            .await
+            .unwrap();
+        assert!(v.is_some());
+        assert_eq!(v.unwrap().as_ref(), b"v1");
+        let mut new_data = vec![];
+        let mut prefix = BytesMut::new();
+        prefix.extend_from_slice(b"abcde");
+        for i in 0..20u64 {
+            prefix.extend_from_slice(&i.to_le_bytes());
+            new_data.push(generate_data_with_partition(0, &prefix, b"v2"));
+            prefix.resize(5, 0);
+        }
+        write_options.epoch = 3;
+        engine.flush(new_data, write_options.clone()).await.unwrap();
+        let _ = engine.flush_dirty_pages_before(3, 3).await;
     }
 }

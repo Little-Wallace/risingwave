@@ -363,10 +363,6 @@ impl SharedBufferBatch {
         }
     }
 
-    fn count(&self) -> usize {
-        self.inner.payload.len() + self.inner.range_tombstone_list.len()
-    }
-
     /// Do not count range tombstone.
     ///  Copy data between [left, right).
     pub fn copy_batch_between_range(&self, left: &[u8], right: &[u8]) -> SharedBufferBatch {

@@ -5,7 +5,10 @@ use std::sync::Arc;
 use bytes::Bytes;
 use futures::future::try_join_all;
 use risingwave_common::catalog::TableId;
+use risingwave_common::util::epoch::INVALID_EPOCH;
 use risingwave_hummock_sdk::key::TableKey;
+use risingwave_hummock_sdk::HummockReadEpoch;
+use tracing::warn;
 
 use crate::bwtree::bw_tree_engine::BwTreeEngine;
 use crate::error::StorageResult;
@@ -13,12 +16,14 @@ use crate::hummock::HummockResult;
 use crate::mem_table::{merge_stream, KeyOp, MemTable};
 use crate::storage_value::StorageValue;
 use crate::store::{
-    GetFutureTrait, IterKeyRange, LocalStateStore, MayExistTrait, ReadOptions, StateStoreIter,
-    StateStoreIterExt, StateStoreIterItem, StateStoreIterItemStream, StateStoreIterNextFutureTrait,
-    StreamTypeOfIter, WriteOptions,
+    EmptyFutureTrait, GetFutureTrait, IterFutureTrait, IterKeyRange, LocalStateStore,
+    MayExistTrait, NewLocalOptions, ReadOptions, StateStoreIter, StateStoreIterExt,
+    StateStoreIterItem, StateStoreIterItemStream, StateStoreIterNextFutureTrait, StateStoreRead,
+    StreamTypeOfIter, SyncFutureTrait, SyncResult, WriteOptions,
 };
+use crate::StateStore;
 
-pub struct LocalStore {
+pub struct LocalBwTreeStore {
     table_id: TableId,
     page: Arc<BwTreeEngine>,
     mem_table: MemTable,
@@ -31,7 +36,7 @@ pub struct BwTreeEngineCore {
 
 impl BwTreeEngineCore {
     /// This method only allow one thread calling.
-    pub async fn flush_dirty_pages_before(&self, epoch: u64) -> HummockResult<()> {
+    pub async fn flush_dirty_pages_before(&self, epoch: u64) -> HummockResult<SyncResult> {
         let mut tasks = vec![];
         for (_, page) in &self.states {
             let root = page.clone();
@@ -43,12 +48,12 @@ impl BwTreeEngineCore {
             tasks.push(handle);
         }
         // TODO: retry or panic
-        let ret = try_join_all(tasks).await;
-        Ok(())
-    }
-
-    pub fn register_local_engine(&mut self, table_id: TableId, page: Arc<BwTreeEngine>) {
-        self.states.insert(table_id, page);
+        let _ret = try_join_all(tasks).await;
+        Ok(SyncResult {
+            sync_size: 0,
+            // TODO: convert object to sstable info.
+            uncommitted_ssts: vec![],
+        })
     }
 }
 
@@ -64,7 +69,7 @@ impl StateStoreIter for BwTreeIterator {
     }
 }
 
-impl LocalStore {
+impl LocalBwTreeStore {
     pub async fn get_inner(&self, key: Bytes, epoch: u64) -> StorageResult<Option<Bytes>> {
         let ret = self.page.get(TableKey(key), epoch).await?;
         Ok(ret)
@@ -98,7 +103,7 @@ impl LocalStore {
     }
 }
 
-impl LocalStateStore for LocalStore {
+impl LocalStateStore for LocalBwTreeStore {
     type FlushFuture<'a> = impl Future<Output = StorageResult<usize>> + 'a;
     type GetFuture<'a> = impl GetFutureTrait<'a>;
     type IterFuture<'a> = impl Future<Output = StorageResult<Self::IterStream<'a>>> + Send + 'a;
@@ -106,7 +111,7 @@ impl LocalStateStore for LocalStore {
 
     define_local_state_store_associated_type!();
 
-    fn get(&self, key: Bytes, read_options: ReadOptions) -> Self::GetFuture<'_> {
+    fn get(&self, key: Bytes, _read_options: ReadOptions) -> Self::GetFuture<'_> {
         self.get_inner(key, self.epoch())
     }
 
@@ -148,10 +153,10 @@ impl LocalStateStore for LocalStore {
                     KeyOp::Insert(value) => {
                         kv_pairs.push((key, StorageValue::new_put(value)));
                     }
-                    KeyOp::Delete(old_value) => {
+                    KeyOp::Delete(_old_value) => {
                         kv_pairs.push((key, StorageValue::new_delete()));
                     }
-                    KeyOp::Update((old_value, new_value)) => {
+                    KeyOp::Update((_old_value, new_value)) => {
                         kv_pairs.push((key, StorageValue::new_put(new_value)));
                     }
                 }
@@ -176,10 +181,10 @@ impl LocalStateStore for LocalStore {
     }
 
     fn init(&mut self, epoch: u64) {
-        todo!()
+        self.epoch = Some(epoch);
     }
 
-    fn seal_current_epoch(&mut self, next_epoch: u64) {
+    fn seal_current_epoch(&mut self, _next_epoch: u64) {
         todo!()
     }
 
@@ -189,5 +194,109 @@ impl LocalStateStore for LocalStore {
         read_options: ReadOptions,
     ) -> Self::MayExistFuture<'_> {
         self.may_exist_inner(key_range, read_options)
+    }
+}
+
+#[derive(Clone)]
+pub struct BwTreeStorage {
+    core: Arc<tokio::sync::RwLock<BwTreeEngineCore>>,
+}
+
+impl BwTreeStorage {
+    async fn sync_inner(&self, epoch: u64) -> StorageResult<SyncResult> {
+        let ret = self
+            .core
+            .read()
+            .await
+            .flush_dirty_pages_before(epoch)
+            .await?;
+        Ok(ret)
+    }
+
+    async fn iter_inner(
+        &self,
+        _key_range: IterKeyRange,
+        _epoch: u64,
+        _read_options: ReadOptions,
+    ) -> StorageResult<StreamTypeOfIter<BwTreeIterator>> {
+        let iter = BwTreeIterator {};
+        Ok(iter.into_stream())
+    }
+
+    async fn get_inner(
+        &self,
+        key: Bytes,
+        epoch: u64,
+        table_id: TableId,
+    ) -> StorageResult<Option<Bytes>> {
+        let engine = {
+            let guard = self.core.read().await;
+            guard.states.get(&table_id).cloned()
+        };
+        let engine = match engine {
+            Some(engine) => engine,
+            None => return Ok(None),
+        };
+        let ret = engine.get(TableKey(key), epoch).await?;
+        Ok(ret)
+    }
+
+    async fn new_local_inner(&self, _options: NewLocalOptions) -> LocalBwTreeStore {
+        unimplemented!("");
+    }
+}
+
+impl StateStoreRead for BwTreeStorage {
+    type IterStream = StreamTypeOfIter<BwTreeIterator>;
+
+    define_state_store_read_associated_type!();
+
+    fn get(&self, key: Bytes, epoch: u64, read_options: ReadOptions) -> Self::GetFuture<'_> {
+        self.get_inner(key, epoch, read_options.table_id)
+    }
+
+    fn iter(
+        &self,
+        key_range: IterKeyRange,
+        epoch: u64,
+        read_options: ReadOptions,
+    ) -> Self::IterFuture<'_> {
+        self.iter_inner(key_range, epoch, read_options)
+    }
+}
+
+impl StateStore for BwTreeStorage {
+    type Local = LocalBwTreeStore;
+
+    type NewLocalFuture<'a> = impl Future<Output = Self::Local> + Send + 'a;
+
+    define_state_store_associated_type!();
+
+    fn try_wait_epoch(&self, _wait_epoch: HummockReadEpoch) -> Self::WaitEpochFuture<'_> {
+        async move { Ok(()) }
+    }
+
+    fn sync(&self, epoch: u64) -> Self::SyncFuture<'_> {
+        self.sync_inner(epoch)
+    }
+
+    fn seal_epoch(&self, epoch: u64, _is_checkpoint: bool) {
+        if epoch == INVALID_EPOCH {
+            warn!("sealing invalid epoch");
+            return;
+        }
+    }
+
+    fn clear_shared_buffer(&self) -> Self::ClearSharedBufferFuture<'_> {
+        // TODO: we must clean all dirty page and uncommited page.
+        async { Ok(()) }
+    }
+
+    fn new_local(&self, option: NewLocalOptions) -> Self::NewLocalFuture<'_> {
+        self.new_local_inner(option)
+    }
+
+    fn validate_read_epoch(&self, epoch: HummockReadEpoch) -> StorageResult<()> {
+        Ok(())
     }
 }

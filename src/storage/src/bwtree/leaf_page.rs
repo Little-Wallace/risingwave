@@ -105,10 +105,6 @@ impl LeafPage {
         self.id
     }
 
-    pub fn get_middle_key(&self) -> Bytes {
-        self.raw.get_middle_key()
-    }
-
     pub fn check_valid_read(&self, user_key: &Bytes) -> bool {
         if self.right_link != INVALID_PAGE_ID && self.largest_user_key.le(user_key) {
             return false;

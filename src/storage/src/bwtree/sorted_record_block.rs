@@ -145,24 +145,6 @@ impl SortedRecordBlock {
     pub fn iter<'a>(&'a self) -> BlockIterator<'a> {
         BlockIterator::new(self)
     }
-
-    pub fn get_middle_key(&self) -> Bytes {
-        let restart_index = self.restart_points.len() / 2;
-        if restart_index == 0 {
-            let mut iter = self.iter();
-            iter.seek_to_first();
-            let mut count = 0;
-            while count < self.record_count / 2 {
-                iter.next();
-                count += 1;
-            }
-            iter.key.freeze()
-        } else {
-            let offset = self.restart_point(restart_index) as usize;
-            let prefix = KeyPrefix::decode(&mut &self.data()[offset..], offset);
-            Bytes::copy_from_slice(&self.data()[prefix.diff_key_range()])
-        }
-    }
 }
 
 /// [`KeyPrefix`] contains info for prefix compression.
@@ -253,21 +235,6 @@ impl<'a> BlockIterator<'a> {
         self.next_inner();
     }
 
-    pub fn try_next(&mut self) -> bool {
-        assert!(self.is_valid());
-        self.try_next_inner()
-    }
-
-    pub fn prev(&mut self) {
-        assert!(self.is_valid());
-        self.prev_inner();
-    }
-
-    pub fn try_prev(&mut self) -> bool {
-        assert!(self.is_valid());
-        self.try_prev_inner()
-    }
-
     pub fn key(&self) -> &[u8] {
         assert!(self.is_valid());
         &self.key[..]
@@ -290,23 +257,9 @@ impl<'a> BlockIterator<'a> {
         self.seek_restart_point_by_index(0);
     }
 
-    pub fn seek_to_last(&mut self) {
-        self.seek_restart_point_by_index(self.block.restart_point_len() - 1);
-        self.next_until_prev_offset(self.block.size());
-    }
-
     pub fn seek(&mut self, key: &[u8]) {
         self.seek_restart_point_by_key(key);
         self.next_until_key(key);
-    }
-
-    pub fn seek_le(&mut self, key: &[u8]) {
-        self.seek_restart_point_by_key(key);
-        self.next_until_key(key);
-        if !self.is_valid() {
-            self.seek_to_last();
-        }
-        self.prev_until_key(key);
     }
 }
 
@@ -361,50 +314,6 @@ impl<'a> BlockIterator<'a> {
         {
             self.next_inner();
         }
-    }
-
-    /// Moves backward until reaching the first key that equals or smaller than the given `key`.
-    fn prev_until_key(&mut self, key: &[u8]) {
-        while self.is_valid()
-            && KeyComparator::compare_encoded_full_key(&self.key[..], key) == Ordering::Greater
-        {
-            self.prev_inner();
-        }
-    }
-
-    /// Moves forward until the position reaches the previous position of the given `next_offset` or
-    /// the last valid position if exists.
-    fn next_until_prev_offset(&mut self, offset: usize) {
-        while self.offset + self.entry_len < std::cmp::min(self.block.size(), offset) {
-            self.next_inner();
-        }
-    }
-
-    /// Moving to the previous entry
-    ///
-    /// Note: The current state may be invalid if there is no more data to read
-    fn prev_inner(&mut self) {
-        if !self.try_prev_inner() {
-            self.invalidate();
-        }
-    }
-
-    /// Try moving to the previous entry.
-    ///
-    /// The current state will still be valid if there is no more data to read.
-    ///
-    /// Return: true is the iterator is advanced and false otherwise.
-    fn try_prev_inner(&mut self) -> bool {
-        if self.offset == 0 {
-            return false;
-        }
-        if self.block.restart_point(self.restart_point_index) as usize == self.offset {
-            self.restart_point_index -= 1;
-        }
-        let origin_offset = self.offset;
-        self.seek_restart_point_by_index(self.restart_point_index);
-        self.next_until_prev_offset(origin_offset);
-        true
     }
 
     /// Decodes [`KeyPrefix`] at given offset.
