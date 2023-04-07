@@ -5,7 +5,7 @@ use crate::hummock::HummockResult;
 pub struct PageStore {}
 
 impl PageStore {
-    pub async fn get_data_page(&self, pid: PageId) -> HummockResult<LeafPage> {
+    pub async fn get_data_page(&self, _pid: PageId) -> HummockResult<LeafPage> {
         unimplemented!()
     }
 }

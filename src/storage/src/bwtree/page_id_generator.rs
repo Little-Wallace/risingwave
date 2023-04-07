@@ -8,6 +8,7 @@ use crate::hummock::HummockResult;
 #[async_trait]
 pub trait PageIdGenerator: Send + Sync {
     async fn get_new_page_id(&self) -> HummockResult<PageId>;
+    async fn get_new_page_ids(&self, count: usize) -> HummockResult<Vec<PageId>>;
 }
 
 pub struct LocalPageIdGenerator {
@@ -27,5 +28,18 @@ impl PageIdGenerator for LocalPageIdGenerator {
     async fn get_new_page_id(&self) -> HummockResult<PageId> {
         let next_id = self.id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(next_id)
+    }
+
+    async fn get_new_page_ids(&self, count: usize) -> HummockResult<Vec<PageId>> {
+        assert!(count > 0);
+        let count = count as u64;
+        let next_id = self
+            .id
+            .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+        let mut ret = vec![];
+        for idx in 0..count {
+            ret.push(next_id + idx);
+        }
+        Ok(ret)
     }
 }

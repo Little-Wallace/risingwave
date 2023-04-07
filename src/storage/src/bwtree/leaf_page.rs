@@ -14,6 +14,7 @@ pub struct LeafPage {
     raw: SortedRecordBlock,
     id: PageId,
     right_link: PageId,
+    epoch: u64,
     pub parent_link: PageId,
     pub smallest_user_key: Bytes,
     // The largest user key always equals the smallest user key of right-link page.
@@ -41,7 +42,7 @@ impl LeafPage {
             raw_value.clear();
         }
         let raw = SortedRecordBlock::decode(builder.build(), 0).unwrap();
-        LeafPage::new(pid, smallest_user_key, largest_user_key, raw)
+        LeafPage::new(pid, smallest_user_key, largest_user_key, raw, epoch)
     }
 
     pub fn new(
@@ -49,6 +50,7 @@ impl LeafPage {
         smallest_key: Bytes,
         largest_key: Bytes,
         raw: SortedRecordBlock,
+        epoch: u64,
     ) -> LeafPage {
         LeafPage {
             raw,
@@ -57,6 +59,7 @@ impl LeafPage {
             parent_link: INVALID_PAGE_ID,
             smallest_user_key: smallest_key,
             largest_user_key: largest_key,
+            epoch,
         }
     }
 
@@ -98,11 +101,15 @@ impl LeafPage {
     }
 
     pub fn page_size(&self) -> usize {
-        self.raw.size()
+        self.raw.raw_data().len()
     }
 
     pub fn get_page_id(&self) -> PageId {
         self.id
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
     }
 
     pub fn check_valid_read(&self, user_key: &Bytes) -> bool {

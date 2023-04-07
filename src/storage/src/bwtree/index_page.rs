@@ -7,7 +7,7 @@ use parking_lot::RwLock;
 use crate::bwtree::{PageId, INVALID_PAGE_ID};
 use crate::hummock::sstable::utils::get_length_prefixed_slice;
 
-#[derive(Eq, PartialEq, Clone, Copy)]
+#[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum PageType {
     Index,
     Leaf,
@@ -37,10 +37,6 @@ impl SonPageInfo {
     }
 }
 
-struct TreeInfoData {
-    nodes: Vec<SonPageInfo>,
-}
-
 ///  Index Page records the index of leaf-page or other index-page. height represents height of this
 /// sub-tree. If the height is 1, it means that all son of this sub-tree is leaf-page.
 /// since index-page cache-miss would not be frequent, we can decode it as skip-list.
@@ -58,35 +54,18 @@ pub struct IndexPage {
     smallest_user_key: Bytes,
 }
 
-impl TreeInfoData {
-    pub fn encode(&self, buf: &mut BytesMut) {
-        buf.put_u16_le(self.nodes.len() as u16);
-        for node in &self.nodes {
-            node.encode_to(buf);
-        }
-    }
-
-    pub fn decode(buf: &mut &[u8]) -> Self {
-        let node_count = buf.get_u16_le() as usize;
-        let mut nodes = Vec::with_capacity(node_count);
-        for _ in 0..node_count {
-            nodes.push(SonPageInfo::decode_from(buf));
-        }
-        Self { nodes }
-    }
-}
-
 impl IndexPage {
     pub fn new(
         pid: PageId,
         parent_link: PageId,
         smallest_user_key: Bytes,
+        epoch: u64,
         height: usize,
     ) -> IndexPage {
         Self {
             pid,
             sub_tree: Default::default(),
-            epoch: 0,
+            epoch,
             height,
             parent_link,
             right_link: INVALID_PAGE_ID,
@@ -111,10 +90,12 @@ impl IndexPage {
 
     pub fn decode(data: &Bytes) -> Self {
         let mut buf = data.as_ref();
-        let data = TreeInfoData::decode(&mut buf);
+        let node_count = buf.get_u16_le() as usize;
         let mut sub_tree = BTreeMap::new();
-        for sub_info in data.nodes {
-            sub_tree.insert(sub_info.smallest_key, sub_info.page_id);
+        for _ in 0..node_count {
+            let page_id = buf.get_u64_le();
+            let smallest_key = Bytes::from(get_length_prefixed_slice(&mut buf));
+            sub_tree.insert(smallest_key, page_id);
         }
         let pid = buf.get_u64_le();
         let epoch = buf.get_u64_le();
@@ -142,10 +123,13 @@ impl IndexPage {
     }
 
     pub fn get_page_in_range(&self, key: &Bytes) -> (PageId, PageType) {
-        let mut index = self.sub_tree.range((
-            std::ops::Bound::Included(key.clone()),
-            std::ops::Bound::Unbounded,
-        ));
+        let mut index = self
+            .sub_tree
+            .range((
+                std::ops::Bound::Unbounded,
+                std::ops::Bound::Included(key.clone()),
+            ))
+            .rev();
         let (_, page_idx) = index.next().unwrap();
         let ptype = if self.height == 1 {
             PageType::Leaf
@@ -157,10 +141,9 @@ impl IndexPage {
 
     pub fn get_right_link_in_range(&self, key: &Bytes) -> PageId {
         let mut index = self.sub_tree.range((
-            std::ops::Bound::Included(key.clone()),
+            std::ops::Bound::Excluded(key.clone()),
             std::ops::Bound::Unbounded,
         ));
-        index.next().unwrap();
         if let Some((_, pid)) = index.next() {
             return *pid;
         }
@@ -246,26 +229,17 @@ impl IndexPageDelta {
 pub struct IndexPageDeltaChain {
     uncommited_delta: Vec<IndexPageDelta>,
     immutable_delta_count: usize,
-    current_epoch: u64,
     base_page: IndexPage,
 }
 
 pub type IndexPageHolder = Arc<RwLock<IndexPageDeltaChain>>;
 
 impl IndexPageDeltaChain {
-    pub fn create(
-        deltas: Vec<IndexPageDelta>,
-        base_page: IndexPage,
-        max_commit_epoch: u64,
-    ) -> IndexPageHolder {
-        Arc::new(RwLock::new(Self::new(deltas, base_page, max_commit_epoch)))
+    pub fn create(deltas: Vec<IndexPageDelta>, base_page: IndexPage) -> IndexPageHolder {
+        Arc::new(RwLock::new(Self::new(deltas, base_page)))
     }
 
-    pub fn new(
-        deltas: Vec<IndexPageDelta>,
-        mut base_page: IndexPage,
-        max_commit_epoch: u64,
-    ) -> Self {
+    pub fn new(deltas: Vec<IndexPageDelta>, mut base_page: IndexPage) -> Self {
         let immutable_delta_count = deltas.len();
         for delta in deltas {
             if delta.smo == SMOType::Add {
@@ -275,7 +249,6 @@ impl IndexPageDeltaChain {
             }
         }
         Self {
-            current_epoch: max_commit_epoch,
             immutable_delta_count,
             uncommited_delta: vec![],
             base_page,
@@ -294,15 +267,14 @@ impl IndexPageDeltaChain {
         self.base_page.get_right_link_in_range(key)
     }
 
-    pub fn append_delta(&mut self, delta: IndexPageDelta) {
+    pub fn apply_delta(&mut self, delta: IndexPageDelta) {
         if delta.smo == SMOType::Add {
             self.base_page
-                .insert_page(delta.son.smallest_key.clone(), delta.son.page_id);
+                .insert_page(delta.son.smallest_key, delta.son.page_id);
         } else {
             self.base_page.delete_page(&delta.son.smallest_key);
         }
         self.immutable_delta_count += 1;
-        self.uncommited_delta.push(delta);
     }
 
     pub fn shall_reconcile(&self, max_reconcile_count: usize) -> bool {
@@ -316,17 +288,15 @@ impl IndexPageDeltaChain {
     pub fn set_page(&mut self, commit_epoch: u64, page: IndexPage) {
         self.uncommited_delta
             .retain(|delta| delta.epoch > commit_epoch);
-        self.immutable_delta_count = self.uncommited_delta.len();
         self.base_page = page;
     }
 
     pub fn reconsile(&mut self, commit_epoch: u64) -> Bytes {
         let mut buf = BytesMut::new();
+        self.base_page.epoch = commit_epoch;
         self.base_page.encode_to(&mut buf);
         let data = buf.freeze();
-        self.uncommited_delta
-            .retain(|delta| delta.epoch > commit_epoch);
-        self.immutable_delta_count = self.uncommited_delta.len();
+        self.immutable_delta_count = 0;
         data
     }
 
@@ -383,21 +353,5 @@ impl IndexPageDeltaChain {
 
     pub fn encode_page(&mut self, buf: &mut BytesMut) {
         self.base_page.encode_to(buf);
-    }
-
-    pub fn commit_delta(&mut self, commit_epoch: u64, buf: &mut BytesMut) {
-        buf.put_u64_le(commit_epoch);
-        buf.put_u32_le(self.uncommited_delta.len() as u32);
-        for delta in self
-            .uncommited_delta
-            .drain_filter(|delta| delta.epoch <= commit_epoch)
-        {
-            delta.son.encode_to(buf);
-            if delta.smo == SMOType::Add {
-                buf.put_u8(0);
-            } else {
-                buf.put_u8(1);
-            }
-        }
     }
 }

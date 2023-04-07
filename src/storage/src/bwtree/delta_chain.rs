@@ -10,7 +10,6 @@ use crate::bwtree::sorted_data_builder::{
     BlockBuilder, BlockBuilderOptions, DEFAULT_RESTART_INTERVAL,
 };
 use crate::bwtree::sorted_record_block::SortedRecordBlock;
-use crate::bwtree::INVALID_PAGE_ID;
 use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::CompressionAlgorithm;
 
@@ -23,7 +22,6 @@ pub struct Delta {
 }
 
 pub struct DeltaChain {
-    current_epoch: u64,
     current_data_size: usize,
     mem_deltas: Vec<SharedBufferBatch>,
     history_delta: Vec<Arc<Delta>>,
@@ -36,7 +34,6 @@ impl DeltaChain {
     pub fn new(base_page: Arc<LeafPage>) -> Self {
         Self {
             current_data_size: 0,
-            current_epoch: 0,
             mem_deltas: vec![],
             history_delta: vec![],
             base_page,
@@ -46,10 +43,6 @@ impl DeltaChain {
     pub fn ingest(&mut self, batch: SharedBufferBatch) {
         self.current_data_size += batch.size();
         self.mem_deltas.push(batch);
-    }
-
-    pub fn seal_epoch(&mut self, epoch: u64) {
-        self.current_epoch = epoch;
     }
 
     /// call commit after flush.
@@ -101,16 +94,8 @@ impl DeltaChain {
     pub fn update_size(&self) -> usize {
         self.history_delta
             .iter()
-            .map(|delta| delta.raw.size())
+            .map(|delta| delta.raw.raw_data().len())
             .sum::<usize>()
-    }
-
-    pub fn update_count(&self) -> usize {
-        self.history_delta.len()
-    }
-
-    pub fn get_page(&self) -> Arc<LeafPage> {
-        self.base_page.clone()
     }
 
     pub fn get_page_ref(&self) -> &LeafPage {
@@ -128,10 +113,17 @@ impl DeltaChain {
         self.base_page.get(vk)
     }
 
-    pub fn apply_to_page(&self, max_split_size: usize, safe_epoch: u64) -> Vec<LeafPage> {
+    pub fn apply_to_page(
+        &self,
+        max_split_size: usize,
+        max_split_count: usize,
+        safe_epoch: u64,
+    ) -> Vec<LeafPage> {
         let mut iters = Vec::with_capacity(self.history_delta.len());
+        let mut max_epoch = self.base_page.epoch();
         for delta in &self.history_delta {
             iters.push(delta.raw.iter());
+            max_epoch = std::cmp::max(max_epoch, delta.max_epoch);
         }
         iters.push(self.base_page.iter());
         let mut pages = vec![];
@@ -139,9 +131,15 @@ impl DeltaChain {
         merge_iter.seek_to_first();
         let mut last_user_key = vec![];
         let mut smallest_key = self.base_page.smallest_user_key.clone();
-        let mut data_size = self.base_page.page_size() + self.update_size();
-        let split_count = (data_size + max_split_size - 1) / max_split_size;
-        let split_size = data_size / split_count;
+        let data_size = self.base_page.page_size() + self.update_size();
+        let mut split_count = 1;
+        if max_split_size < usize::MAX {
+            split_count = std::cmp::min(
+                max_split_count,
+                (data_size + max_split_size - 1) / max_split_size,
+            );
+        }
+        let mut split_size = data_size / split_count;
         let mut builder = BlockBuilder::new(BlockBuilderOptions {
             capacity: split_size + 1024,
             compression_algorithm: CompressionAlgorithm::None,
@@ -155,13 +153,17 @@ impl DeltaChain {
             {
                 builder.add(merge_iter.key(), merge_iter.raw_value());
             }
-            if !ukey.eq(last_user_key.as_slice()) && builder.approximate_len() > split_size {
+            if split_count > 1
+                && !ukey.eq(last_user_key.as_slice())
+                && builder.approximate_len() > split_size
+            {
                 let largest_key = Bytes::copy_from_slice(ukey);
                 pages.push(LeafPage::new(
-                    INVALID_PAGE_ID,
+                    self.base_page.get_page_id(),
                     smallest_key,
                     largest_key.clone(),
                     SortedRecordBlock::decode(builder.build(), 0).unwrap(),
+                    max_epoch,
                 ));
                 builder = BlockBuilder::new(BlockBuilderOptions {
                     capacity: SPLIT_LEAF_CAPACITY,
@@ -176,10 +178,11 @@ impl DeltaChain {
         }
         if !builder.is_empty() {
             pages.push(LeafPage::new(
-                INVALID_PAGE_ID,
+                self.base_page.get_page_id(),
                 smallest_key,
                 self.base_page.largest_user_key.clone(),
                 SortedRecordBlock::decode(builder.build(), 0).unwrap(),
+                max_epoch,
             ));
         }
         pages
@@ -270,7 +273,7 @@ mod tests {
         // safe epoch, would delete all MVCC
         let delta = delta_chains.flush(3).unwrap();
         delta_chains.commit(delta, 3);
-        let mut new_pages = delta_chains.apply_to_page(160, 3);
+        let mut new_pages = delta_chains.apply_to_page(160, 10, 3);
         assert_eq!(new_pages.len(), 1);
         let page = new_pages.pop().unwrap();
         let mut iter = page.iter();
@@ -303,7 +306,7 @@ mod tests {
         delta_chains.ingest(build_shared_buffer_batch(data, 4));
         let delta = delta_chains.flush(4).unwrap();
         delta_chains.commit(delta, 3);
-        let mut new_pages = delta_chains.apply_to_page(160, 4);
+        let new_pages = delta_chains.apply_to_page(160, 10, 4);
         assert_eq!(new_pages.len(), 2);
         let mut idx = 0;
         let mut iter = new_pages[0].iter();

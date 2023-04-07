@@ -296,7 +296,7 @@ impl StateStore for BwTreeStorage {
         self.new_local_inner(option)
     }
 
-    fn validate_read_epoch(&self, epoch: HummockReadEpoch) -> StorageResult<()> {
+    fn validate_read_epoch(&self, _epoch: HummockReadEpoch) -> StorageResult<()> {
         Ok(())
     }
 }
