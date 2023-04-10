@@ -36,6 +36,10 @@ impl MappingTable {
         self.delta_chains.write().remove(pid);
     }
 
+    pub fn remove_index_delta(&self, pid: &PageId) {
+        self.index_pages.write().remove(pid);
+    }
+
     pub fn get_leaf_page(&self, pid: PageId) -> Option<PageHolder> {
         self.leaf_pages.lookup(pid, &pid)
     }

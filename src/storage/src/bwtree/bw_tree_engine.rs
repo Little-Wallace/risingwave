@@ -32,6 +32,7 @@ pub struct EngineOptions {
     pub leaf_min_merge_size: usize,
     pub index_split_count: usize,
     pub index_reconcile_count: usize,
+    pub index_min_merge_count: usize,
 }
 
 impl Default for EngineOptions {
@@ -40,8 +41,9 @@ impl Default for EngineOptions {
             leaf_reconcile_size: 32 * 1024,
             index_split_count: 256,
             leaf_split_size: 64 * 1024,
-            leaf_min_merge_size: 16 * 1024,
+            leaf_min_merge_size: 32 * 1024,
             index_reconcile_count: 32,
+            index_min_merge_count: 128,
         }
     }
 }
@@ -178,28 +180,34 @@ impl BwTreeEngine {
             };
             while !kvs.is_empty() {
                 let right_link = {
+                    // TODO: use optimistic lock mode to avoid hold mutex too long.
                     let mut current_page = delta.write();
-                    let page = current_page.get_page_ref();
-                    let right_link = page.get_right_link();
-                    let mut last_data = Vec::with_capacity(kvs.len());
-                    while let Some(kv) = kvs.front() {
-                        if right_link == INVALID_PAGE_ID || kv.0 < page.largest_user_key {
-                            let kv = kvs.pop_front().unwrap();
-                            last_data.push(kv);
-                        } else {
-                            break;
+                    match current_page.get_pending_merge_page() {
+                        Some(page_id) => page_id,
+                        None => {
+                            let page = current_page.get_page_ref();
+                            let right_link = page.get_right_link();
+                            let mut last_data = Vec::with_capacity(kvs.len());
+                            while let Some(kv) = kvs.front() {
+                                if right_link == INVALID_PAGE_ID || kv.0 < page.largest_user_key {
+                                    let kv = kvs.pop_front().unwrap();
+                                    last_data.push(kv);
+                                } else {
+                                    break;
+                                }
+                            }
+                            if !last_data.is_empty() {
+                                dirty_pages.push(page.get_page_id());
+                                flush_size += self.ingest_batch(
+                                    current_page.deref_mut(),
+                                    last_data,
+                                    write_options.epoch,
+                                    write_options.table_id,
+                                );
+                            }
+                            right_link
                         }
                     }
-                    if !last_data.is_empty() {
-                        dirty_pages.push(page.get_page_id());
-                        flush_size += self.ingest_batch(
-                            current_page.deref_mut(),
-                            last_data,
-                            write_options.epoch,
-                            write_options.table_id,
-                        );
-                    }
-                    right_link
                 };
                 if !kvs.is_empty() {
                     assert!(right_link != INVALID_PAGE_ID);
@@ -295,7 +303,7 @@ impl BwTreeEngine {
         Ok(page)
     }
 
-    async fn get_leaf_page_delta(
+    pub(crate) async fn get_leaf_page_delta(
         &self,
         pid: PageId,
         parent_page_id: PageId,
@@ -395,6 +403,7 @@ mod tests {
                 leaf_min_merge_size: 50,
                 index_reconcile_count: 2,
                 index_split_count: 6,
+                index_min_merge_count: 3,
             },
         );
         let mut write_options = WriteOptions {

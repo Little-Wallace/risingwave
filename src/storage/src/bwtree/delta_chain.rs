@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use bytes::{Buf, Bytes, BytesMut};
 use itertools::Itertools;
+use parking_lot::RwLock;
 use risingwave_hummock_sdk::key::{split_key_epoch, StateTableKey};
 
 use crate::bwtree::data_iterator::{MergedDataIterator, MergedSharedBufferIterator};
@@ -10,6 +11,7 @@ use crate::bwtree::sorted_data_builder::{
     BlockBuilder, BlockBuilderOptions, DEFAULT_RESTART_INTERVAL,
 };
 use crate::bwtree::sorted_record_block::SortedRecordBlock;
+use crate::bwtree::{PageId, INVALID_PAGE_ID};
 use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::CompressionAlgorithm;
 
@@ -28,6 +30,7 @@ pub struct DeltaChain {
     // TODO: replace it with PageId because we do not hope every write operation fetch the whole
     // page from remote-storage.
     base_page: Arc<LeafPage>,
+    merge_target_id: Option<PageId>,
 }
 
 impl DeltaChain {
@@ -36,8 +39,13 @@ impl DeltaChain {
             current_data_size: 0,
             mem_deltas: vec![],
             history_delta: vec![],
+            merge_target_id: None,
             base_page,
         }
+    }
+
+    pub fn get_pending_merge_page(&self) -> Option<PageId> {
+        self.merge_target_id
     }
 
     pub fn ingest(&mut self, batch: SharedBufferBatch) {
@@ -111,6 +119,64 @@ impl DeltaChain {
             }
         }
         self.base_page.get(vk)
+    }
+
+    fn add_data_to_builder(&self, max_epoch: u64, safe_epoch: u64, builder: &mut BlockBuilder) {
+        let mut iters = Vec::with_capacity(self.history_delta.len() + 1);
+        for delta in &self.history_delta {
+            assert!(delta.max_epoch <= max_epoch);
+            iters.push(delta.raw.iter());
+        }
+        iters.push(self.base_page.iter());
+        let mut last_user_key = vec![];
+        let mut merge_iter = MergedDataIterator::new(iters);
+        merge_iter.seek_to_first();
+        while merge_iter.is_valid() {
+            let (ukey, mut epoch) = split_key_epoch(merge_iter.key());
+            let epoch = epoch.get_u64();
+            if epoch > safe_epoch
+                || (!ukey.eq(last_user_key.as_slice()) && !merge_iter.value().is_delete())
+            {
+                builder.add(merge_iter.key(), merge_iter.raw_value());
+            }
+            last_user_key.clear();
+            last_user_key.extend_from_slice(ukey);
+            merge_iter.next();
+        }
+    }
+
+    pub fn merge_pages(
+        &self,
+        max_epoch: u64,
+        safe_epoch: u64,
+        merge_capacity: usize,
+        pages: &[Arc<RwLock<DeltaChain>>],
+    ) -> LeafPage {
+        let mut builder = BlockBuilder::new(BlockBuilderOptions {
+            capacity: merge_capacity + 1024,
+            compression_algorithm: CompressionAlgorithm::None,
+            restart_interval: DEFAULT_RESTART_INTERVAL,
+        });
+        let mut largest_key = Bytes::new();
+        // Use page-id of the left page and right-link of the right page.
+        let mut right_link = INVALID_PAGE_ID;
+        self.add_data_to_builder(max_epoch, safe_epoch, &mut builder);
+        for page in pages {
+            let guard = page.read();
+            right_link = guard.get_page_ref().get_right_link();
+            largest_key = guard.get_page_ref().largest_user_key.clone();
+            guard.add_data_to_builder(max_epoch, safe_epoch, &mut builder);
+        }
+        let mut page = LeafPage::new(
+            self.base_page.get_page_id(),
+            self.base_page.smallest_user_key.clone(),
+            largest_key,
+            SortedRecordBlock::decode(builder.build(), 0).unwrap(),
+            max_epoch,
+        );
+        page.set_right_link(right_link);
+        page.set_parent_link(self.base_page.parent_link);
+        page
     }
 
     pub fn apply_to_page(
@@ -194,6 +260,10 @@ impl DeltaChain {
 
     pub fn get_shared_memory_buffer(&self) -> Vec<SharedBufferBatch> {
         self.mem_deltas.clone()
+    }
+
+    pub fn set_pending_merge(&mut self, target_page_id: PageId) {
+        self.merge_target_id = Some(target_page_id);
     }
 
     pub fn set_new_page(&mut self, page: Arc<LeafPage>) {

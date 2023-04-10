@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use itertools::Itertools;
 use parking_lot::RwLock;
 
 use crate::bwtree::{PageId, INVALID_PAGE_ID};
@@ -191,6 +192,14 @@ impl IndexPage {
         self.pid
     }
 
+    pub fn get_son_count(&self) -> usize {
+        self.sub_tree.len()
+    }
+
+    pub fn get_son_pages(&self) -> Vec<PageId> {
+        self.sub_tree.iter().map(|(_, p)| *p).collect_vec()
+    }
+
     pub fn delete_page(&mut self, key: &Bytes) {
         self.sub_tree.remove(key);
     }
@@ -316,9 +325,14 @@ impl IndexPageDeltaChain {
         self.base_page.parent_link
     }
 
-    pub fn split_to_pages(&self, commit_epoch: u64) -> Vec<IndexPage> {
+    pub fn split_to_pages(&self, max_split_index_size: usize, commit_epoch: u64) -> Vec<IndexPage> {
         let mut pages = vec![];
-        let split_size = self.base_page.sub_tree.len() / 2;
+        let split_count =
+            (self.base_page.sub_tree.len() + max_split_index_size - 1) / max_split_index_size;
+        let split_size = std::cmp::min(
+            max_split_index_size,
+            self.base_page.sub_tree.len() / split_count,
+        );
         let mut sub_tree = BTreeMap::default();
         let mut smallest_user_key = self.base_page.smallest_user_key.clone();
         for (smallest_key, pid) in &self.base_page.sub_tree {
@@ -353,5 +367,31 @@ impl IndexPageDeltaChain {
 
     pub fn encode_page(&mut self, buf: &mut BytesMut) {
         self.base_page.encode_to(buf);
+    }
+
+    pub fn set_new_page(&mut self, page: IndexPage) {
+        self.uncommited_delta.clear();
+        self.base_page = page;
+    }
+
+    pub fn merge_pages(&self, max_epoch: u64, pages: &[Arc<RwLock<Self>>]) -> IndexPage {
+        let mut sub_tree = self.base_page.sub_tree.clone();
+        let mut right_link = self.base_page.right_link;
+        for delta_chains in pages {
+            let guard = delta_chains.read();
+            for (k, v) in &guard.base_page.sub_tree {
+                sub_tree.insert(k.clone(), *v);
+            }
+            right_link = self.base_page.get_right_link();
+        }
+        IndexPage {
+            pid: self.base_page.get_page_id(),
+            sub_tree,
+            epoch: max_epoch,
+            height: self.base_page.height,
+            right_link,
+            parent_link: self.base_page.parent_link,
+            smallest_user_key: Default::default(),
+        }
     }
 }
