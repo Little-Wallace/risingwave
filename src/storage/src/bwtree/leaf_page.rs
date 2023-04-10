@@ -15,7 +15,6 @@ pub struct LeafPage {
     id: PageId,
     right_link: PageId,
     epoch: u64,
-    pub parent_link: PageId,
     pub smallest_user_key: Bytes,
     // The largest user key always equals the smallest user key of right-link page.
     pub largest_user_key: Bytes,
@@ -56,7 +55,6 @@ impl LeafPage {
             raw,
             id,
             right_link: INVALID_PAGE_ID,
-            parent_link: INVALID_PAGE_ID,
             smallest_user_key: smallest_key,
             largest_user_key: largest_key,
             epoch,
@@ -73,10 +71,6 @@ impl LeafPage {
 
     pub fn set_right_link(&mut self, right_link: PageId) {
         self.right_link = right_link;
-    }
-
-    pub fn set_parent_link(&mut self, parent_link: PageId) {
-        self.parent_link = parent_link;
     }
 
     pub fn get_smallest_key_in_data(&self) -> Bytes {

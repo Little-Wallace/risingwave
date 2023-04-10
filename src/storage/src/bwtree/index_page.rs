@@ -15,13 +15,13 @@ pub enum PageType {
 }
 
 #[derive(Eq, PartialEq, Clone)]
-pub struct SonPageInfo {
+pub struct SubtreePageInfo {
     pub page_id: PageId,
     // table_key, do not include epoch.
     pub smallest_key: Bytes,
 }
 
-impl SonPageInfo {
+impl SubtreePageInfo {
     pub fn encode_to(&self, buf: &mut BytesMut) {
         buf.put_u64_le(self.page_id);
         buf.put_u32_le(self.smallest_key.len() as u32);
@@ -160,16 +160,8 @@ impl IndexPage {
         self.right_link
     }
 
-    pub fn get_parent_link(&self) -> PageId {
-        self.parent_link
-    }
-
     pub fn set_right_link(&mut self, pid: PageId) {
         self.right_link = pid;
-    }
-
-    pub fn set_parent_link(&mut self, pid: PageId) {
-        self.parent_link = pid;
     }
 
     pub fn set_smallest_key(&mut self, key: Bytes) {
@@ -217,7 +209,7 @@ pub enum SMOType {
 
 #[derive(Clone)]
 pub struct IndexPageDelta {
-    pub son: SonPageInfo,
+    pub son: SubtreePageInfo,
     pub smo: SMOType,
     pub epoch: u64,
 }
@@ -225,7 +217,7 @@ pub struct IndexPageDelta {
 impl IndexPageDelta {
     pub fn new(smo: SMOType, page_id: PageId, epoch: u64, smallest_key: Bytes) -> Self {
         Self {
-            son: SonPageInfo {
+            son: SubtreePageInfo {
                 page_id,
                 smallest_key,
             },
@@ -323,6 +315,10 @@ impl IndexPageDeltaChain {
 
     pub fn get_parent_link(&self) -> PageId {
         self.base_page.parent_link
+    }
+
+    pub fn set_parent_link(&mut self, pid: PageId) {
+        self.base_page.parent_link = pid;
     }
 
     pub fn split_to_pages(&self, max_split_index_size: usize, commit_epoch: u64) -> Vec<IndexPage> {

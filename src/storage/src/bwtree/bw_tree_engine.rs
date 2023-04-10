@@ -11,7 +11,7 @@ use risingwave_hummock_sdk::key::{get_vnode_id, StateTableKey, TableKey};
 use spin::Mutex;
 
 use crate::bwtree::delta_chain::DeltaChain;
-use crate::bwtree::index_page::{IndexPageHolder, PageType};
+use crate::bwtree::index_page::PageType;
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::mapping_table::MappingTable;
 use crate::bwtree::page_id_generator::PageIdGenerator;
@@ -295,7 +295,6 @@ impl BwTreeEngine {
         // epoch before set this page to page-mapping because every reconcile operation would
         // generate a new page with larger epoch.
         page.set_right_link(info.right_link);
-        page.set_parent_link(info.parent_link);
         page.smallest_user_key = info.smallest_user_key;
         page.largest_user_key = info.largest_user_key;
         let page = Arc::new(page);
@@ -315,7 +314,9 @@ impl BwTreeEngine {
                     Some(page) => page.value().clone(),
                     None => self.get_leaf_page(pid, parent_page_id).await?,
                 };
-                let delta = DeltaChain::new(page);
+                let mut delta = DeltaChain::new(page);
+                // TODO: check whether parent page is pending split or merge.
+                delta.set_parent_link(parent_page_id);
                 Ok(self.page_mapping.insert_delta(pid, delta))
             }
         }
@@ -377,13 +378,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use bytes::{Bytes, BytesMut};
-    use parking_lot::lock_api::RwLock;
+    use bytes::BytesMut;
     use risingwave_common::catalog::TableId;
     use risingwave_hummock_sdk::key::TableKey;
 
     use crate::bwtree::bw_tree_engine::{BwTreeEngine, EngineOptions};
-    use crate::bwtree::index_page::{IndexPage, IndexPageDelta, IndexPageDeltaChain};
     use crate::bwtree::mapping_table::MappingTable;
     use crate::bwtree::page_id_generator::LocalPageIdGenerator;
     use crate::bwtree::page_store::PageStore;
@@ -434,6 +433,7 @@ mod tests {
             )
             .await
             .unwrap();
+        let _ = engine.flush_dirty_pages_before(2, 2).await;
         let v = engine
             .get(TableKey(get_key_with_partition(0, b"abcdfg")), 2)
             .await
@@ -451,12 +451,26 @@ mod tests {
         write_options.epoch = 3;
         engine.flush(new_data, write_options.clone()).await.unwrap();
         // Flush and split the origin page. It would generate the first index-page.
-        let _ = engine.flush_dirty_pages_before(3, 3).await;
+        let data = engine.flush_dirty_pages_before(3, 3).await.unwrap();
+        assert_eq!(data.leaf.len(), 3);
+        assert_eq!(data.vnodes.len(), 1);
         prefix.extend_from_slice(&1u64.to_le_bytes());
         let v = engine
             .get(TableKey(get_key_with_partition(0, &prefix)), 3)
             .await
             .unwrap();
         assert_eq!(v.unwrap().as_ref(), b"v2");
+        println!("==================================");
+        let mut new_data = vec![];
+        for i in 20..40u64 {
+            prefix.extend_from_slice(&i.to_le_bytes());
+            new_data.push(generate_data_with_partition(0, &prefix, b"v2"));
+            prefix.resize(5, 0);
+        }
+        write_options.epoch = 4;
+        engine.flush(new_data, write_options.clone()).await.unwrap();
+        // Flush and split the origin page. It would generate the first index-page.
+        let data = engine.flush_dirty_pages_before(4, 4).await.unwrap();
+        assert_eq!(data.leaf.len(), 5);
     }
 }
