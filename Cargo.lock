@@ -6618,6 +6618,7 @@ name = "risingwave_storage"
 version = "0.2.0-alpha"
 dependencies = [
  "arc-swap",
+ "async-recursion",
  "async-trait",
  "auto_enums",
  "await-tree",

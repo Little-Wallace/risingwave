@@ -14,6 +14,7 @@ ignored = ["workspace-hack"]
 normal = ["workspace-hack"]
 
 [dependencies]
+async-recursion="1.0.1"
 arc-swap = "1"
 async-trait = "0.1"
 auto_enums = { version = "0.7", features = ["futures"] }

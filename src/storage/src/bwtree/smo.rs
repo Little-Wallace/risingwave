@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use async_recursion::async_recursion;
 use bytes::{Bytes, BytesMut};
 use itertools::Itertools;
 use parking_lot::RwLock;
@@ -112,9 +113,163 @@ impl BwTreeEngine {
         Ok(new_vnodes)
     }
 
+    #[async_recursion]
+    async fn update_index_page(
+        &self,
+        current_page: PageId,
+        mut dirty_index_page_changes: Vec<(Bytes, Vec<IndexPageDelta>)>,
+        epoch: u64,
+        safe_epoch: u64,
+        checkpoint: &mut CheckpointData,
+    ) -> HummockResult<IndexPageRedoLogRecord> {
+        let index_delta_chain = self.page_mapping.get_index_page(&current_page);
+        let mut next_changes = vec![];
+        let mut meet_leaf = false;
+        let mut shall_split = false;
+        let mut shall_reconcile = false;
+
+        let mut record = IndexPageRedoLogRecord {
+            redo_logs: vec![],
+            deltas: vec![],
+            smo_pages_height: 0,
+            update_page_id: current_page,
+        };
+        {
+            let read_guard = index_delta_chain.read();
+            meet_leaf = read_guard.get_base_page().get_height() == 1;
+            record.smo_pages_height = read_guard.get_base_page().get_height() - 1;
+            if !meet_leaf {
+                let groups = dirty_index_page_changes.into_iter().group_by(|(k, _)| {
+                    let (pid, _) = read_guard.get_page_in_range(&k);
+                    pid
+                });
+                for (next_page_id, sons) in groups.into_iter() {
+                    next_changes.push((next_page_id, sons.collect_vec()));
+                }
+            } else {
+                next_changes.push((INVALID_PAGE_ID, dirty_index_page_changes));
+            }
+        }
+
+        if !meet_leaf {
+            for (next_page_id, sons) in next_changes {
+                let r = self
+                    .update_index_page(next_page_id, sons, epoch, safe_epoch, checkpoint)
+                    .await?;
+                if !r.redo_logs.is_empty() {
+                    record.deltas.extend(r.deltas);
+                    record.redo_logs.extend(r.redo_logs);
+                }
+            }
+            let mut write_guard = index_delta_chain.write();
+            for delta in &record.deltas {
+                write_guard.apply_delta(delta.clone());
+            }
+            checkpoint.index_redo_log.push(record);
+            shall_split = write_guard.shall_split(self.options.index_split_count);
+            shall_reconcile = write_guard.shall_reconcile(self.options.index_reconcile_count);
+        } else {
+            let mut write_guard = index_delta_chain.write();
+            for (_, changes) in next_changes {
+                for (_, deltas) in changes {
+                    record.redo_logs.push(SMORedoLogRecord {
+                        origin_pages: vec![deltas[0].son.page_id],
+                        new_pages: deltas.iter().map(|change| change.son.page_id).collect_vec(),
+                        smo_kind: SMO_SPLIT,
+                    });
+                    for delta in &deltas {
+                        write_guard.apply_delta(delta.clone());
+                    }
+                    record.deltas.extend(deltas);
+                }
+            }
+            checkpoint.index_redo_log.push(record);
+            shall_split = write_guard.shall_split(self.options.index_split_count);
+            shall_reconcile = write_guard.shall_reconcile(self.options.index_reconcile_count);
+        }
+        let mut new_record = IndexPageRedoLogRecord {
+            redo_logs: vec![],
+            deltas: vec![],
+            smo_pages_height: 0,
+            update_page_id: INVALID_PAGE_ID,
+        };
+        if shall_split {
+            let merged_pages = self
+                .may_merge(epoch, safe_epoch, index_delta_chain.clone(), checkpoint)
+                .await?;
+            for (merge, index_deltas) in merged_pages {
+                new_record.redo_logs.push(SMORedoLogRecord {
+                    new_pages: vec![*merge.last().unwrap()],
+                    origin_pages: merge,
+                    smo_kind: SMO_MERGE,
+                });
+                new_record.deltas.extend(index_deltas);
+            }
+            let (mut first_page, other_pages, mut origin_right_link) = {
+                let guard = index_delta_chain.read();
+                let mut pages = guard.split_to_pages(self.options.index_split_count, epoch);
+                pages.reverse();
+                let mut first_page = pages.pop().unwrap();
+                first_page.set_page_id(guard.get_base_page_id());
+                (first_page, pages, guard.get_right_link())
+            };
+            let mut smo_record = SMORedoLogRecord {
+                origin_pages: vec![first_page.get_page_id()],
+                new_pages: vec![],
+                smo_kind: SMO_SPLIT,
+            };
+            let mut index_data = BytesMut::new();
+            for mut page in other_pages {
+                let new_page_id = self.get_new_page_id().await?;
+                new_record.deltas.push(IndexPageDelta {
+                    son: SubtreePageInfo {
+                        page_id: new_page_id,
+                        smallest_key: page.get_smallest_key(),
+                    },
+                    epoch,
+                    smo: SMOType::Add,
+                });
+                smo_record.new_pages.push(new_page_id);
+                page.set_page_id(new_page_id);
+                page.set_right_link(origin_right_link);
+                page.encode_to(&mut index_data);
+                origin_right_link = new_page_id;
+                let chain = IndexPageDeltaChain::create(vec![], page);
+                self.page_mapping.insert_index_delta(new_page_id, chain);
+                checkpoint
+                    .index
+                    .push((new_page_id, Bytes::copy_from_slice(&index_data)));
+                index_data.clear();
+            }
+            new_record.deltas.push(IndexPageDelta {
+                son: SubtreePageInfo {
+                    page_id: first_page.get_page_id(),
+                    smallest_key: first_page.get_smallest_key(),
+                },
+                epoch,
+                smo: SMOType::Add,
+            });
+            smo_record.new_pages.push(first_page.get_page_id());
+            smo_record.new_pages.reverse();
+            new_record.redo_logs.push(smo_record);
+            new_record.deltas.reverse();
+            first_page.set_right_link(origin_right_link);
+            index_delta_chain.write().set_page(epoch, first_page);
+        } else if shall_reconcile {
+            new_record.redo_logs.push(SMORedoLogRecord {
+                origin_pages: vec![current_page],
+                new_pages: vec![current_page],
+                smo_kind: SMO_RECONCILE,
+            });
+            let data = index_delta_chain.write().reconsile(epoch);
+            checkpoint.index.push((current_page, data));
+        }
+        Ok(new_record)
+    }
+
     pub(crate) async fn execute_smo(
         &self,
-        mut dirty_index_page_changes: Vec<(PageId, Vec<IndexPageDelta>)>,
+        mut dirty_index_page_changes: Vec<(usize, Bytes, Vec<IndexPageDelta>)>,
         epoch: u64,
         safe_epoch: u64,
         checkpoint: &mut CheckpointData,
@@ -126,202 +281,53 @@ impl BwTreeEngine {
             new_vnodes.insert(vnode, (pid, ptp));
         }
         dirty_index_page_changes.sort_by_key(|a| a.0);
-        let mut index_change_records = vec![];
-        for (dirty_index_page_id, page_changes) in
-            &dirty_index_page_changes.into_iter().group_by(|a| a.0)
-        {
+        let dirty_index_page_changes = dirty_index_page_changes.into_iter().group_by(|a| a.0).into_iter().map(|(a, b)| (a, b.collect_vec())).collect_vec();
+        let mut vnode_changes = vec![];
+        for (vnode_id, page_changes) in dirty_index_page_changes {
+            let (index_page_id, page_type) = new_vnodes.get(&vnode_id).unwrap().clone();
             let mut record = IndexPageRedoLogRecord {
                 redo_logs: vec![],
                 deltas: vec![],
                 smo_pages_height: 0,
-                update_page_id: dirty_index_page_id,
+                update_page_id: INVALID_PAGE_ID,
             };
-            for (_, changes) in page_changes {
-                let new_pages = changes
-                    .iter()
-                    .map(|change| change.son.page_id)
+            if page_type == PageType::Leaf {
+                let deltas = page_changes
+                    .into_iter()
+                    .flat_map(|(_, son_key, deltas)| deltas)
                     .collect_vec();
-                if dirty_index_page_id == INVALID_PAGE_ID {
-                    let mut r = record.clone();
-                    r.redo_logs.push(SMORedoLogRecord {
-                        origin_pages: vec![changes[0].son.page_id],
-                        smo_kind: SMO_SPLIT,
-                        new_pages,
-                    });
-                    r.deltas = changes;
-                    index_change_records.push(r);
-                } else {
-                    record.redo_logs.push(SMORedoLogRecord {
-                        origin_pages: vec![changes[0].son.page_id],
-                        new_pages: changes
-                            .iter()
-                            .map(|change| change.son.page_id)
-                            .collect_vec(),
-                        smo_kind: SMO_SPLIT,
-                    });
-                    record.deltas.extend(changes);
-                }
+                record.redo_logs.push(SMORedoLogRecord {
+                    origin_pages: vec![index_page_id],
+                    new_pages: deltas.iter().map(|d| d.son.page_id).collect_vec(),
+                    smo_kind: SMO_CREATE_ROOT_PAGE,
+                });
+                record.deltas = deltas;
+            } else {
+                let mut sons = page_changes
+                    .into_iter()
+                    .map(|(_, son_key, deltas)| (son_key, deltas))
+                    .collect_vec();
+                sons.sort_by(|a, b| a.0.cmp(&b.0));
+                record = self
+                    .update_index_page(index_page_id, sons, epoch, safe_epoch, checkpoint)
+                    .await?;
             }
-            if dirty_index_page_id != INVALID_PAGE_ID {
-                index_change_records.push(record);
+            if record.deltas.is_empty() && record.redo_logs.is_empty() {
+                continue;
             }
-        }
-        let mut vnode_changes = vec![];
-        while !index_change_records.is_empty() {
-            let mut parent_change_records = vec![];
-            for mut record in index_change_records.drain(..) {
-                if record.deltas.is_empty() {
-                    // this is reconcile redo log.
-                    checkpoint.index_redo_log.push(record);
-                    continue;
-                }
-                if record.update_page_id == INVALID_PAGE_ID {
-                    let new_pid = self.page_id_manager.get_new_page_id().await?;
-                    let origin_pid = record.deltas[0].son.page_id;
-                    let new_pages = record
-                        .deltas
-                        .iter()
-                        .map(|delta| delta.son.page_id)
-                        .collect_vec();
-                    let index_page = IndexPage::new(
-                        new_pid,
-                        INVALID_PAGE_ID,
-                        Bytes::new(),
-                        epoch,
-                        record.smo_pages_height + 1,
-                    );
-                    let chain = IndexPageDeltaChain::create(record.deltas.clone(), index_page);
-                    self.page_mapping.insert_index_delta(new_pid, chain.clone());
-                    for p in &new_pages {
-                        if record.smo_pages_height == 0 {
-                            if let Some(leaf) = self.page_mapping.get_data_chains(&p) {
-                                leaf.write().set_parent_link(new_pid);
-                            }
-                        } else {
-                            let son_page = self.page_mapping.get_index_page(&p);
-                            son_page.write().set_parent_link(new_pid);
-                        }
-                    }
-                    checkpoint
-                        .index
-                        .push((new_pid, chain.write().reconsile(epoch)));
-                    assert_eq!(record.redo_logs.len(), 1);
-                    record.redo_logs.last_mut().unwrap().smo_kind = SMO_CREATE_ROOT_PAGE;
-                    record.update_page_id = new_pid;
-                    checkpoint.index_redo_log.push(record);
-                    vnode_changes.push((origin_pid, new_pid, PageType::Index));
-                    continue;
-                }
-                let deltas_chain = self.page_mapping.get_index_page(&record.update_page_id);
-                let (parent_link, height, shall_split, shall_reconcile) = {
-                    // Here we do not hold the write lock because we assume that there would be only
-                    // thread to do SMO.
-                    let mut guard = deltas_chain.write();
-                    for delta in &record.deltas {
-                        guard.apply_delta(delta.clone());
-                    }
-                    (
-                        guard.get_parent_link(),
-                        guard.get_base_page().get_height(),
-                        guard.shall_split(self.options.index_split_count),
-                        guard.shall_reconcile(self.options.index_reconcile_count),
-                    )
-                };
-
-                let mut new_record = IndexPageRedoLogRecord {
-                    redo_logs: vec![],
-                    deltas: vec![],
-                    update_page_id: parent_link,
-                    smo_pages_height: height,
-                };
-                if shall_split {
-                    let merged_pages = self
-                        .may_merge(epoch, safe_epoch, deltas_chain.clone(), checkpoint)
-                        .await?;
-                    for (merge, index_deltas) in merged_pages {
-                        new_record.redo_logs.push(SMORedoLogRecord {
-                            new_pages: vec![*merge.last().unwrap()],
-                            origin_pages: merge,
-                            smo_kind: SMO_MERGE,
-                        });
-                        new_record.deltas.extend(index_deltas);
-                    }
-                    let mut new_page_id = self.get_new_page_id().await?;
-                    let (first_page, other_pages) = {
-                        let guard = deltas_chain.read();
-                        let mut pages = guard.split_to_pages(self.options.index_split_count, epoch);
-                        let mut smo_record = SMORedoLogRecord {
-                            origin_pages: vec![pages[0].get_page_id()],
-                            new_pages: vec![],
-                            smo_kind: SMO_SPLIT,
-                        };
-                        for p in &pages {
-                            smo_record.new_pages.push(p.get_page_id());
-                        }
-                        let other_pages = pages.split_off(1);
-                        let mut first_page = pages.pop().unwrap();
-                        first_page.set_page_id(guard.get_base_page_id());
-                        first_page.set_right_link(new_page_id);
-                        (first_page, other_pages)
-                    };
-                    new_record.deltas.push(IndexPageDelta {
-                        son: SubtreePageInfo {
-                            page_id: first_page.get_page_id(),
-                            smallest_key: first_page.get_smallest_key(),
-                        },
-                        epoch,
-                        smo: SMOType::Add,
-                    });
-                    let mut index_data = BytesMut::new();
-                    for mut page in other_pages {
-                        new_record.deltas.push(IndexPageDelta {
-                            son: SubtreePageInfo {
-                                page_id: new_page_id,
-                                smallest_key: page.get_smallest_key(),
-                            },
-                            epoch,
-                            smo: SMOType::Add,
-                        });
-                        page.set_page_id(new_page_id);
-                        new_page_id = self.get_new_page_id().await?;
-                        page.set_right_link(new_page_id);
-                        page.encode_to(&mut index_data);
-                        let chain = IndexPageDeltaChain::create(vec![], page);
-                        self.page_mapping.insert_index_delta(new_page_id, chain);
-                        checkpoint
-                            .index
-                            .push((new_page_id, Bytes::copy_from_slice(&index_data)));
-                        index_data.clear();
-                    }
-                    // clear because we do not need persist these delta, we will persist the new
-                    // pages in storage.
-                    record.deltas.clear();
-                    deltas_chain.write().set_page(epoch, first_page);
-                    parent_change_records.push(new_record);
-                } else if shall_reconcile {
-                    new_record.redo_logs.push(SMORedoLogRecord {
-                        origin_pages: vec![record.update_page_id],
-                        new_pages: vec![record.update_page_id],
-                        smo_kind: SMO_RECONCILE,
-                    });
-                    let data = deltas_chain.write().reconsile(epoch);
-                    checkpoint.index.push((record.update_page_id, data));
-                    record.deltas.clear();
-                    parent_change_records.push(new_record);
-                }
-                checkpoint.index_redo_log.push(record);
-            }
-            parent_change_records.sort_by_key(|record| record.update_page_id);
-            for record in parent_change_records {
-                if let Some(last) = index_change_records.last_mut() {
-                    if last.update_page_id == record.update_page_id {
-                        last.redo_logs.extend(record.redo_logs);
-                        last.deltas.extend(record.deltas);
-                        continue;
-                    }
-                }
-                index_change_records.push(record);
-            }
+            let new_pid = self.page_id_manager.get_new_page_id().await?;
+            let index_page =
+                IndexPage::new(new_pid, Bytes::new(), epoch, record.smo_pages_height + 1);
+            let chain = IndexPageDeltaChain::create(record.deltas.clone(), index_page);
+            self.page_mapping.insert_index_delta(new_pid, chain.clone());
+            checkpoint
+                .index
+                .push((new_pid, chain.write().reconsile(epoch)));
+            assert_eq!(record.redo_logs.len(), 1);
+            record.redo_logs.last_mut().unwrap().smo_kind = SMO_CREATE_ROOT_PAGE;
+            record.update_page_id = new_pid;
+            checkpoint.index_redo_log.push(record);
+            vnode_changes.push((vnode_id, new_pid, PageType::Index));
         }
 
         if vnode_changes.is_empty() {
@@ -330,15 +336,8 @@ impl BwTreeEngine {
             return Ok(());
         }
 
-        let mut reverse_index = HashMap::with_capacity(new_vnodes.len());
-        for (k, (pid, _)) in &new_vnodes {
-            reverse_index.insert(*pid, *k);
-        }
-        for (origin_pid, new_pid, tp) in vnode_changes {
-            if origin_pid != INVALID_PAGE_ID {
-                let vnode_id = reverse_index.get(&origin_pid).unwrap();
-                new_vnodes.insert(*vnode_id, (new_pid, tp));
-            }
+        for (vnode_id, new_pid, tp) in vnode_changes {
+            new_vnodes.insert(vnode_id, (new_pid, tp));
         }
         checkpoint.vnodes = new_vnodes.clone();
         self.vnodes.store(Arc::new(new_vnodes));
@@ -372,18 +371,18 @@ impl BwTreeEngine {
             leaf_deltas: vec![],
             commited_epoch: epoch,
         };
-        for pid in dirty_pages {
+        for (vnode_id, pid) in dirty_pages {
             let dirty_page = self.page_mapping.get_data_chains(&pid).unwrap();
             let delta = match dirty_page.read().flush(epoch) {
                 None => continue,
                 Some(delta) => delta,
             };
             dirty_page.write().commit(delta.clone(), epoch);
-            let (origin_page_right_link, parent_link, update_size, base_leaf_size) = {
+            let (origin_page_right_link, page_left_key, update_size, base_leaf_size) = {
                 let guard = dirty_page.read();
                 (
                     guard.get_page_ref().get_right_link(),
-                    guard.get_parent_link(),
+                    guard.get_page_ref().smallest_user_key.clone(),
                     guard.update_size(),
                     guard.get_page_ref().page_size(),
                 )
@@ -449,7 +448,8 @@ impl BwTreeEngine {
                     // reverse to make origin page id at first.
                     leaf_pages.reverse();
                     dirty_index.push((
-                        parent_link,
+                        vnode_id,
+                        page_left_key,
                         leaf_pages
                             .iter()
                             .map(|p| {
@@ -543,7 +543,6 @@ impl BwTreeEngine {
         };
 
         checkpoint.index.push((merged_id, buf.freeze()));
-        // TODO: remove page after all read-request ended.
         let mut removed_delta = Vec::with_capacity(pages.len());
         for delta_chains in pages.iter() {
             let page = delta_chains.read();
@@ -581,6 +580,7 @@ impl BwTreeEngine {
         }
         let mut merged_pages = vec![];
         let mut last_page_ids = vec![];
+        let read_version = self.gc_collector.get_snapshot();
 
         if is_leaf {
             let mut last_sons = vec![];
@@ -588,7 +588,7 @@ impl BwTreeEngine {
             // from right to left
             sub_pages.reverse();
             for pid in &sub_pages {
-                let delta = self.get_leaf_page_delta(*pid, parent_id).await?;
+                let delta = self.get_leaf_page_delta(*pid).await?;
                 let sz = {
                     let guard = delta.read();
                     guard.get_page_ref().page_size() + guard.update_size()
@@ -607,6 +607,9 @@ impl BwTreeEngine {
                             checkpoint,
                         )?;
                         merged_pages.push((std::mem::take(&mut last_page_ids), removed_info));
+                        for merged_page in last_sons.drain(..) {
+                            read_version.add_leaf_page(merged_page);
+                        }
                     }
                     last_sons.clear();
                     last_page_ids.clear();
@@ -625,6 +628,9 @@ impl BwTreeEngine {
                     checkpoint,
                 )?;
                 merged_pages.push((last_page_ids, removed_info));
+                for merged_page in last_sons {
+                    read_version.add_leaf_page(merged_page);
+                }
             }
         } else {
             let mut last_sons = vec![];
@@ -646,6 +652,9 @@ impl BwTreeEngine {
                             self.merge_index_pages(epoch, &mut last_sons, checkpoint)?;
                         merged_pages.push((std::mem::take(&mut last_page_ids), removed_info));
                     }
+                    for merged_page in last_sons.drain(..) {
+                        read_version.add_index_page(merged_page);
+                    }
                     last_sons.clear();
                     last_page_ids.clear();
                     if sz < self.options.index_split_count {
@@ -657,6 +666,9 @@ impl BwTreeEngine {
             if last_sons.len() > 1 {
                 let removed_info = self.merge_index_pages(epoch, &mut last_sons, checkpoint)?;
                 merged_pages.push((last_page_ids, removed_info));
+                for merged_page in last_sons {
+                    read_version.add_index_page(merged_page);
+                }
             }
         }
         Ok(merged_pages)

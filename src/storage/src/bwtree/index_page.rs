@@ -51,24 +51,16 @@ pub struct IndexPage {
     // Do not encode these fields because we can recover it from parent info.
     height: usize,
     right_link: PageId,
-    parent_link: PageId,
     smallest_user_key: Bytes,
 }
 
 impl IndexPage {
-    pub fn new(
-        pid: PageId,
-        parent_link: PageId,
-        smallest_user_key: Bytes,
-        epoch: u64,
-        height: usize,
-    ) -> IndexPage {
+    pub fn new(pid: PageId, smallest_user_key: Bytes, epoch: u64, height: usize) -> IndexPage {
         Self {
             pid,
             sub_tree: Default::default(),
             epoch,
             height,
-            parent_link,
             right_link: INVALID_PAGE_ID,
             smallest_user_key,
         }
@@ -106,7 +98,6 @@ impl IndexPage {
             height: 0,
             epoch,
             right_link: INVALID_PAGE_ID,
-            parent_link: INVALID_PAGE_ID,
             smallest_user_key: Bytes::new(),
         }
     }
@@ -313,14 +304,6 @@ impl IndexPageDeltaChain {
         self.base_page.right_link
     }
 
-    pub fn get_parent_link(&self) -> PageId {
-        self.base_page.parent_link
-    }
-
-    pub fn set_parent_link(&mut self, pid: PageId) {
-        self.base_page.parent_link = pid;
-    }
-
     pub fn split_to_pages(&self, max_split_index_size: usize, commit_epoch: u64) -> Vec<IndexPage> {
         let mut pages = vec![];
         let split_count =
@@ -339,7 +322,6 @@ impl IndexPageDeltaChain {
                     height: self.base_page.height,
                     epoch: commit_epoch,
                     right_link: 0,
-                    parent_link: self.base_page.parent_link,
                     smallest_user_key,
                 });
                 sub_tree = BTreeMap::default();
@@ -354,7 +336,6 @@ impl IndexPageDeltaChain {
                 height: self.base_page.height,
                 epoch: commit_epoch,
                 right_link: 0,
-                parent_link: self.base_page.parent_link,
                 smallest_user_key,
             });
         }
@@ -386,7 +367,6 @@ impl IndexPageDeltaChain {
             epoch: max_epoch,
             height: self.base_page.height,
             right_link,
-            parent_link: self.base_page.parent_link,
             smallest_user_key: Default::default(),
         }
     }

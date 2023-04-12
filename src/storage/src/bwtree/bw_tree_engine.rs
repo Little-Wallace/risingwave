@@ -11,6 +11,7 @@ use risingwave_hummock_sdk::key::{get_vnode_id, StateTableKey, TableKey};
 use spin::Mutex;
 
 use crate::bwtree::delta_chain::DeltaChain;
+use crate::bwtree::gc_page_collector::GcPageCollector;
 use crate::bwtree::index_page::PageType;
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::mapping_table::MappingTable;
@@ -23,7 +24,7 @@ use crate::storage_value::StorageValue;
 use crate::store::WriteOptions;
 
 pub struct DirtyPageUpdates {
-    pub pages: Vec<PageId>,
+    pub pages: Vec<(usize, PageId)>,
 }
 
 pub struct EngineOptions {
@@ -49,7 +50,6 @@ impl Default for EngineOptions {
 }
 
 pub struct PageInfo {
-    parent_link: PageId,
     right_link: PageId,
     smallest_user_key: Bytes,
     largest_user_key: Bytes,
@@ -64,6 +64,7 @@ pub struct BwTreeEngine {
     pub(crate) page_store: PageStore,
     pub(crate) updates: Mutex<HashMap<u64, DirtyPageUpdates>>,
     pub(crate) options: EngineOptions,
+    pub(crate) gc_collector: GcPageCollector,
 }
 
 impl BwTreeEngine {
@@ -82,6 +83,7 @@ impl BwTreeEngine {
             page_store,
             options,
             updates: Mutex::new(HashMap::default()),
+            gc_collector: GcPageCollector::default(),
         }
     }
 
@@ -90,15 +92,13 @@ impl BwTreeEngine {
         table_key: TableKey<Bytes>,
         epoch: u64,
     ) -> HummockResult<Option<Bytes>> {
+        let _guard = self.gc_collector.get_snapshot();
         let vnode_id = get_vnode_id(&table_key.0);
         let vnodes = self.vnodes.load();
         match vnodes.get(&vnode_id) {
             Some((page_id, ptp)) => match ptp {
                 PageType::Index => self.search_index_page(table_key, page_id, epoch).await,
-                PageType::Leaf => {
-                    self.search_data_page(table_key, *page_id, INVALID_PAGE_ID, epoch)
-                        .await
-                }
+                PageType::Leaf => self.search_data_page(table_key, *page_id, epoch).await,
             },
             None => {
                 let guard = self.buffer_page.read();
@@ -123,6 +123,7 @@ impl BwTreeEngine {
         // delete_ranges: Vec<(Bytes, Bytes)>,
         write_options: WriteOptions,
     ) -> HummockResult<usize> {
+        let _guard = self.gc_collector.get_snapshot();
         let mut dirty_pages = vec![];
         let vnodes = self.vnodes.load_full();
         let mut flush_size = 0;
@@ -175,7 +176,7 @@ impl BwTreeEngine {
                 Some(delta) => delta,
                 None => {
                     // TODO: using queue to avoid several thread reading one page.
-                    self.get_leaf_page_delta(pid, parent_page_id).await?
+                    self.get_leaf_page_delta(pid).await?
                 }
             };
             while !kvs.is_empty() {
@@ -197,7 +198,7 @@ impl BwTreeEngine {
                                 }
                             }
                             if !last_data.is_empty() {
-                                dirty_pages.push(page.get_page_id());
+                                dirty_pages.push((vnode_id, page.get_page_id()));
                                 flush_size += self.ingest_batch(
                                     current_page.deref_mut(),
                                     last_data,
@@ -212,7 +213,7 @@ impl BwTreeEngine {
                 if !kvs.is_empty() {
                     assert!(right_link != INVALID_PAGE_ID);
                     // TODO: we need seek again because the next page may be too far away
-                    delta = self.get_leaf_page_delta(right_link, parent_page_id).await?;
+                    delta = self.get_leaf_page_delta(right_link).await?;
                 }
             }
         }
@@ -228,27 +229,23 @@ impl BwTreeEngine {
         index_page_id: &PageId,
         epoch: u64,
     ) -> HummockResult<Option<Bytes>> {
-        let (leaf_page_id, index_page_id) = {
+        let leaf_page_id = {
             let index_page = self.page_mapping.get_index_page(index_page_id);
             let page = index_page.read();
-            let mut parent_link = page.get_base_page().get_page_id();
             let mut pinfo = page.get_page_in_range(&table_key);
             while pinfo.1 != PageType::Leaf {
                 let next_page = self.page_mapping.get_index_page(&pinfo.0);
-                parent_link = pinfo.0;
                 pinfo = next_page.read().get_page_in_range(&table_key);
             }
-            (pinfo.0, parent_link)
+            pinfo.0
         };
-        self.search_data_page(table_key, leaf_page_id, index_page_id, epoch)
-            .await
+        self.search_data_page(table_key, leaf_page_id, epoch).await
     }
 
     async fn search_data_page(
         &self,
         table_key: TableKey<Bytes>,
         mut leaf_page_id: PageId,
-        parent_link: PageId,
         epoch: u64,
     ) -> HummockResult<Option<Bytes>> {
         let vk = StateTableKey::new(table_key, epoch);
@@ -265,7 +262,7 @@ impl BwTreeEngine {
                 None => {
                     let leaf = match self.page_mapping.get_leaf_page(leaf_page_id) {
                         Some(page) => page.value().clone(),
-                        None => self.get_leaf_page(leaf_page_id, parent_link).await?,
+                        None => self.get_leaf_page(leaf_page_id).await?,
                     };
                     if !leaf.check_valid_read(&vk.user_key) {
                         leaf_page_id = leaf.get_right_link();
@@ -284,19 +281,8 @@ impl BwTreeEngine {
         (chain, sz)
     }
 
-    async fn get_leaf_page(
-        &self,
-        pid: PageId,
-        parent_page_id: PageId,
-    ) -> HummockResult<Arc<LeafPage>> {
-        let mut page = self.page_store.get_data_page(pid).await?;
-        let info = self.find_next_page(parent_page_id, &page.get_smallest_key_in_data());
-        // TODO: the parent link and right link may be changed by other threads. we can compare
-        // epoch before set this page to page-mapping because every reconcile operation would
-        // generate a new page with larger epoch.
-        page.set_right_link(info.right_link);
-        page.smallest_user_key = info.smallest_user_key;
-        page.largest_user_key = info.largest_user_key;
+    async fn get_leaf_page(&self, pid: PageId) -> HummockResult<Arc<LeafPage>> {
+        let page = self.page_store.get_data_page(pid).await?;
         let page = Arc::new(page);
         self.page_mapping.insert_page(pid, page.clone());
         Ok(page)
@@ -305,49 +291,17 @@ impl BwTreeEngine {
     pub(crate) async fn get_leaf_page_delta(
         &self,
         pid: PageId,
-        parent_page_id: PageId,
     ) -> HummockResult<Arc<RwLock<DeltaChain>>> {
         match self.page_mapping.get_data_chains(&pid) {
             Some(delta) => Ok(delta),
             None => {
                 let page = match self.page_mapping.get_leaf_page(pid) {
                     Some(page) => page.value().clone(),
-                    None => self.get_leaf_page(pid, parent_page_id).await?,
+                    None => self.get_leaf_page(pid).await?,
                 };
                 let mut delta = DeltaChain::new(page);
-                // TODO: check whether parent page is pending split or merge.
-                delta.set_parent_link(parent_page_id);
                 Ok(self.page_mapping.insert_delta(pid, delta))
             }
-        }
-    }
-
-    fn find_next_page(&self, mut parent_link: PageId, user_key: &Bytes) -> PageInfo {
-        while parent_link != INVALID_PAGE_ID {
-            let parent_page = self.page_mapping.get_index_page(&parent_link);
-            let page = parent_page.read();
-            let right_link = page.get_right_link_in_range(&user_key);
-            let (smallest, largest) = page.get_base_page().get_index_key_in_range(user_key);
-            let info = PageInfo {
-                parent_link,
-                right_link,
-                smallest_user_key: smallest,
-                largest_user_key: largest,
-            };
-            if right_link != INVALID_PAGE_ID {
-                return info;
-            }
-            let parent_right_link = page.get_right_link();
-            if parent_right_link == INVALID_PAGE_ID {
-                return info;
-            }
-            parent_link = parent_right_link;
-        }
-        PageInfo {
-            parent_link,
-            right_link: INVALID_PAGE_ID,
-            smallest_user_key: Default::default(),
-            largest_user_key: Default::default(),
         }
     }
 

@@ -1,8 +1,7 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use parking_lot::Mutex;
-use spin::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::bwtree::delta_chain::DeltaChain;
 use crate::bwtree::index_page::IndexPageHolder;

@@ -27,7 +27,6 @@ pub struct DeltaChain {
     current_data_size: usize,
     mem_deltas: Vec<SharedBufferBatch>,
     history_delta: Vec<Arc<Delta>>,
-    parent_link: PageId,
     // TODO: replace it with PageId because we do not hope every write operation fetch the whole
     // page from remote-storage.
     base_page: Arc<LeafPage>,
@@ -42,7 +41,6 @@ impl DeltaChain {
             history_delta: vec![],
             merge_target_id: None,
             base_page,
-            parent_link: INVALID_PAGE_ID,
         }
     }
 
@@ -110,14 +108,6 @@ impl DeltaChain {
 
     pub fn get_page_ref(&self) -> &LeafPage {
         self.base_page.as_ref()
-    }
-
-    pub fn get_parent_link(&self) -> PageId {
-        self.parent_link
-    }
-
-    pub fn set_parent_link(&mut self, link: PageId) {
-        self.parent_link = link;
     }
 
     pub fn get(&self, vk: StateTableKey<Bytes>) -> Option<Bytes> {
@@ -314,6 +304,7 @@ mod tests {
     use crate::bwtree::delta_chain::DeltaChain;
     use crate::bwtree::leaf_page::LeafPage;
     use crate::bwtree::test_utils::{build_shared_buffer_batch, from_slice_key, generate_data};
+    use crate::bwtree::INVALID_PAGE_ID;
 
     #[test]
     fn test_leaf_apply() {
