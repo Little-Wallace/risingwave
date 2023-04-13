@@ -50,69 +50,6 @@ pub struct CheckpointData {
 }
 
 impl BwTreeEngine {
-    async fn flush_dirty_root_page(
-        &self,
-        epoch: u64,
-        checkpoint: &mut CheckpointData,
-    ) -> HummockResult<Vec<(PageId, usize, PageType)>> {
-        let mut changed_deltas = vec![];
-        {
-            let guard = self.buffer_page.read();
-            if !guard.is_empty() {
-                for (vnode_id, delta_chain) in guard.iter() {
-                    if delta_chain.get_page_ref().epoch() > epoch {
-                        continue;
-                    }
-                    if let Some(delta) = delta_chain.flush(epoch) {
-                        changed_deltas.push((*vnode_id, delta));
-                    }
-                }
-            }
-        }
-
-        let need_create_page = changed_deltas.len() > 0;
-        if !changed_deltas.is_empty() {
-            let mut guard = self.buffer_page.write();
-            for (vnode_id, delta) in changed_deltas {
-                guard.get_mut(&vnode_id).unwrap().commit(delta, epoch);
-            }
-        }
-        let mut new_vnodes = vec![];
-        if need_create_page {
-            let mut new_leafs = vec![];
-            {
-                let guard = self.buffer_page.read();
-                for (vnode_id, delta_chain) in guard.iter() {
-                    if delta_chain.get_page_ref().epoch() > epoch {
-                        continue;
-                    }
-                    let mut ret = delta_chain.apply_to_page(self.options.leaf_split_size, 1, epoch);
-                    assert_eq!(ret.len(), 1);
-                    new_leafs.push((*vnode_id, ret.pop().unwrap()));
-                }
-            }
-            let mut created_leafs = Vec::with_capacity(new_leafs.len());
-            for (vnode_id, mut leaf) in new_leafs {
-                let pid = self.get_new_page_id().await?;
-                leaf.set_page_id(pid);
-                created_leafs.push((vnode_id, Arc::new(leaf)));
-            }
-            let mut guard = self.buffer_page.write();
-            let mut new_vnode_map = self.vnodes.load_full().as_ref().clone();
-            for (vnode_id, leaf) in created_leafs {
-                let pid = leaf.get_page_id();
-                checkpoint.leaf.push(leaf.clone());
-                let mut delta = guard.remove(&vnode_id).unwrap();
-                delta.set_new_page(leaf);
-                self.page_mapping.insert_delta(pid, delta);
-                new_vnode_map.insert(vnode_id, (pid, PageType::Leaf));
-                new_vnodes.push((pid, vnode_id, PageType::Leaf));
-            }
-            self.vnodes.store(Arc::new(new_vnode_map));
-        }
-        Ok(new_vnodes)
-    }
-
     #[async_recursion]
     async fn update_index_page(
         &self,
@@ -274,17 +211,16 @@ impl BwTreeEngine {
         safe_epoch: u64,
         checkpoint: &mut CheckpointData,
     ) -> HummockResult<()> {
-        let mut vnodes = self.vnodes.load_full();
-        let mut new_vnodes = vnodes.as_ref().clone();
-        let changed_vnodes = self.flush_dirty_root_page(epoch, checkpoint).await?;
-        for (pid, vnode, ptp) in changed_vnodes {
-            new_vnodes.insert(vnode, (pid, ptp));
-        }
+        let vnodes_map = self.vnodes_map.read().clone();
         dirty_index_page_changes.sort_by_key(|a| a.0);
-        let dirty_index_page_changes = dirty_index_page_changes.into_iter().group_by(|a| a.0).into_iter().map(|(a, b)| (a, b.collect_vec())).collect_vec();
-        let mut vnode_changes = vec![];
+        let dirty_index_page_changes = dirty_index_page_changes
+            .into_iter()
+            .group_by(|a| a.0)
+            .into_iter()
+            .map(|(a, b)| (a, b.collect_vec()))
+            .collect_vec();
         for (vnode_id, page_changes) in dirty_index_page_changes {
-            let (index_page_id, page_type) = new_vnodes.get(&vnode_id).unwrap().clone();
+            let (index_page_id, page_type) = vnodes_map.get(&vnode_id).unwrap().clone();
             let mut record = IndexPageRedoLogRecord {
                 redo_logs: vec![],
                 deltas: vec![],
@@ -327,20 +263,10 @@ impl BwTreeEngine {
             record.redo_logs.last_mut().unwrap().smo_kind = SMO_CREATE_ROOT_PAGE;
             record.update_page_id = new_pid;
             checkpoint.index_redo_log.push(record);
-            vnode_changes.push((vnode_id, new_pid, PageType::Index));
+            checkpoint
+                .vnodes
+                .insert(vnode_id, (new_pid, PageType::Index));
         }
-
-        if vnode_changes.is_empty() {
-            checkpoint.vnodes = new_vnodes.clone();
-            self.vnodes.store(Arc::new(new_vnodes));
-            return Ok(());
-        }
-
-        for (vnode_id, new_pid, tp) in vnode_changes {
-            new_vnodes.insert(vnode_id, (new_pid, tp));
-        }
-        checkpoint.vnodes = new_vnodes.clone();
-        self.vnodes.store(Arc::new(new_vnodes));
         Ok(())
     }
 
@@ -371,6 +297,11 @@ impl BwTreeEngine {
             leaf_deltas: vec![],
             commited_epoch: epoch,
         };
+        for (_, update) in &updates {
+            for (vnode_id, pid) in &update.vnodes {
+                checkpoint.vnodes.insert(*vnode_id, (*pid, PageType::Leaf));
+            }
+        }
         for (vnode_id, pid) in dirty_pages {
             let dirty_page = self.page_mapping.get_data_chains(&pid).unwrap();
             let delta = match dirty_page.read().flush(epoch) {
@@ -470,6 +401,7 @@ impl BwTreeEngine {
         }
         self.execute_smo(dirty_index, epoch, safe_epoch, &mut checkpoint)
             .await?;
+        self.gc_collector.refresh_for_gc();
         Ok(checkpoint)
     }
 
@@ -517,8 +449,6 @@ impl BwTreeEngine {
                 smo: SMOType::Remove,
                 epoch,
             });
-            self.page_mapping
-                .remove_delta_chains(&page.get_page_ref().get_page_id());
         }
         Ok(removed_delta)
     }
@@ -554,8 +484,6 @@ impl BwTreeEngine {
                 smo: SMOType::Remove,
                 epoch,
             });
-            self.page_mapping
-                .remove_index_delta(&page.get_base_page().get_page_id());
         }
         Ok(removed_delta)
     }
@@ -606,10 +534,8 @@ impl BwTreeEngine {
                             &mut last_sons,
                             checkpoint,
                         )?;
+                        read_version.add_leaf_page(&last_page_ids);
                         merged_pages.push((std::mem::take(&mut last_page_ids), removed_info));
-                        for merged_page in last_sons.drain(..) {
-                            read_version.add_leaf_page(merged_page);
-                        }
                     }
                     last_sons.clear();
                     last_page_ids.clear();
@@ -627,10 +553,8 @@ impl BwTreeEngine {
                     &mut last_sons,
                     checkpoint,
                 )?;
+                read_version.add_leaf_page(&last_page_ids);
                 merged_pages.push((last_page_ids, removed_info));
-                for merged_page in last_sons {
-                    read_version.add_leaf_page(merged_page);
-                }
             }
         } else {
             let mut last_sons = vec![];
@@ -650,10 +574,8 @@ impl BwTreeEngine {
                     if last_sons.len() > 1 {
                         let removed_info =
                             self.merge_index_pages(epoch, &mut last_sons, checkpoint)?;
+                        read_version.add_index_page(&last_page_ids);
                         merged_pages.push((std::mem::take(&mut last_page_ids), removed_info));
-                    }
-                    for merged_page in last_sons.drain(..) {
-                        read_version.add_index_page(merged_page);
                     }
                     last_sons.clear();
                     last_page_ids.clear();
@@ -665,10 +587,8 @@ impl BwTreeEngine {
             }
             if last_sons.len() > 1 {
                 let removed_info = self.merge_index_pages(epoch, &mut last_sons, checkpoint)?;
+                read_version.add_index_page(&last_page_ids);
                 merged_pages.push((last_page_ids, removed_info));
-                for merged_page in last_sons {
-                    read_version.add_index_page(merged_page);
-                }
             }
         }
         Ok(merged_pages)

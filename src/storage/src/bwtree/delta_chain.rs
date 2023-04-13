@@ -127,7 +127,9 @@ impl DeltaChain {
             assert!(delta.max_epoch <= max_epoch);
             iters.push(delta.raw.iter());
         }
-        iters.push(self.base_page.iter());
+        if !self.base_page.is_empty() {
+            iters.push(self.base_page.iter());
+        }
         let mut last_user_key = vec![];
         let mut merge_iter = MergedDataIterator::new(iters);
         merge_iter.seek_to_first();
@@ -190,7 +192,9 @@ impl DeltaChain {
             iters.push(delta.raw.iter());
             max_epoch = std::cmp::max(max_epoch, delta.max_epoch);
         }
-        iters.push(self.base_page.iter());
+        if !self.base_page.is_empty() {
+            iters.push(self.base_page.iter());
+        }
         let mut pages = vec![];
         let mut merge_iter = MergedDataIterator::new(iters);
         merge_iter.seek_to_first();

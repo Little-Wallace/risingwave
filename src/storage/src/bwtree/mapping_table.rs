@@ -16,7 +16,7 @@ pub struct MappingTable {
     // TODO: store index-page in lru-cache to avoid use too much memory.
     index_pages: RwLock<HashMap<PageId, Arc<RwLock<IndexPageDeltaChain>>>>,
     /// TODO: replace it with concurrent hash table.
-    delta_chains: Arc<RwLock<HashMap<PageId, Arc<RwLock<DeltaChain>>>>>,
+    delta_chains: RwLock<HashMap<PageId, Arc<RwLock<DeltaChain>>>>,
 }
 
 impl MappingTable {
@@ -24,7 +24,7 @@ impl MappingTable {
         Self {
             leaf_pages: Arc::new(LruCache::new(shard_bits, capacity)),
             index_pages: RwLock::new(HashMap::default()),
-            delta_chains: Arc::new(RwLock::new(HashMap::default())),
+            delta_chains: RwLock::new(HashMap::default()),
         }
     }
 

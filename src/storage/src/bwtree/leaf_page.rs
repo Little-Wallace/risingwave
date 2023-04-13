@@ -21,6 +21,16 @@ pub struct LeafPage {
 }
 
 impl LeafPage {
+    pub fn empty(pid: PageId, epoch: u64) -> Self {
+        LeafPage::new(
+            pid,
+            Bytes::new(),
+            Bytes::new(),
+            SortedRecordBlock::empty(),
+            epoch,
+        )
+    }
+
     pub fn build(
         pid: PageId,
         kvs: Vec<(Bytes, StorageValue)>,
@@ -79,6 +89,9 @@ impl LeafPage {
     }
 
     pub fn get(&self, key: StateTableKey<Bytes>) -> Option<Bytes> {
+        if self.raw.is_empty() {
+            return None;
+        }
         let mut raw_key = BytesMut::default();
         key.encode_into(&mut raw_key);
         let mut iter = BlockIterator::new(&self.raw);
@@ -88,6 +101,10 @@ impl LeafPage {
             return v.into_user_value();
         }
         None
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.raw.is_empty()
     }
 
     pub fn iter(&self) -> BlockIterator<'_> {

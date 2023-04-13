@@ -37,6 +37,15 @@ pub struct SortedRecordBlock {
 }
 
 impl SortedRecordBlock {
+    pub fn empty() -> Self {
+        Self {
+            data: Bytes::new(),
+            data_len: 0,
+            restart_points: vec![],
+            record_count: 0,
+        }
+    }
+
     pub fn decode(buf: Bytes, uncompressed_capacity: usize) -> HummockResult<Self> {
         // Verify checksum.
         let xxhash64_checksum = (&buf[buf.len() - 8..]).get_u64_le();
@@ -91,6 +100,11 @@ impl SortedRecordBlock {
             restart_points,
             record_count,
         }
+    }
+
+    #[inline(always)]
+    pub fn is_empty(&self) -> bool {
+        self.data_len == 0
     }
 
     /// Entries data len.

@@ -5,18 +5,40 @@ use parking_lot::{Mutex, RwLock};
 
 use crate::bwtree::delta_chain::DeltaChain;
 use crate::bwtree::index_page::IndexPageHolder;
-use crate::bwtree::mapping_table::PageHolder;
+use crate::bwtree::mapping_table::{MappingTable, PageHolder};
+use crate::bwtree::PageId;
 
 #[derive(Default)]
 struct RemovedPagesCollector {
-    pages: Vec<Arc<RwLock<DeltaChain>>>,
-    index_pages: Vec<IndexPageHolder>,
+    pages: Vec<PageId>,
+    index_pages: Vec<PageId>,
 }
 
-#[derive(Default)]
 struct ReadVersion {
     next: Option<ReadVersionPtr>,
     collector: RemovedPagesCollector,
+    mapping_table: Arc<MappingTable>,
+}
+
+impl ReadVersion {
+    pub fn new(mapping_table: Arc<MappingTable>) -> Self {
+        Self {
+            collector: RemovedPagesCollector::default(),
+            next: None,
+            mapping_table,
+        }
+    }
+}
+
+impl Drop for ReadVersion {
+    fn drop(&mut self) {
+        for p in &self.collector.pages {
+            self.mapping_table.remove_delta_chains(p);
+        }
+        for p in &self.collector.index_pages {
+            self.mapping_table.remove_index_delta(p);
+        }
+    }
 }
 
 type ReadVersionPtr = Arc<Mutex<ReadVersion>>;
@@ -26,28 +48,30 @@ pub struct ReadGuard {
 }
 
 impl ReadGuard {
-    pub fn add_leaf_page(&self, page: Arc<RwLock<DeltaChain>>) {
-        self.pointer.lock().collector.pages.push(page);
+    pub fn add_leaf_page(&self, pages: &[PageId]) {
+        self.pointer.lock().collector.pages.extend(pages);
     }
 
-    pub fn add_index_page(&self, page: IndexPageHolder) {
-        self.pointer.lock().collector.index_pages.push(page);
+    pub fn add_index_page(&self, pages: &[PageId]) {
+        self.pointer.lock().collector.index_pages.extend(pages);
     }
 }
 
 pub struct GcPageCollector {
     current_pointer: ArcSwap<Mutex<ReadVersion>>,
-}
-
-impl Default for GcPageCollector {
-    fn default() -> Self {
-        Self {
-            current_pointer: ArcSwap::new(Arc::new(Mutex::new(ReadVersion::default()))),
-        }
-    }
+    mapping_table: Arc<MappingTable>,
 }
 
 impl GcPageCollector {
+    pub fn new(mapping_table: Arc<MappingTable>) -> Self {
+        Self {
+            current_pointer: ArcSwap::new(Arc::new(Mutex::new(ReadVersion::new(
+                mapping_table.clone(),
+            )))),
+            mapping_table,
+        }
+    }
+
     pub fn get_snapshot(&self) -> ReadGuard {
         ReadGuard {
             pointer: self.current_pointer.load_full(),
@@ -55,7 +79,7 @@ impl GcPageCollector {
     }
 
     pub fn refresh_for_gc(&self) {
-        let newest_pointer = Arc::new(Mutex::new(ReadVersion::default()));
+        let newest_pointer = Arc::new(Mutex::new(ReadVersion::new(self.mapping_table.clone())));
         let old = self.current_pointer.load();
         let mut old_ptr = old.clone();
         let mut prev = self

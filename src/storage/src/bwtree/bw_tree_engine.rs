@@ -25,6 +25,7 @@ use crate::store::WriteOptions;
 
 pub struct DirtyPageUpdates {
     pub pages: Vec<(usize, PageId)>,
+    pub vnodes: Vec<(usize, PageId)>,
 }
 
 pub struct EngineOptions {
@@ -56,9 +57,7 @@ pub struct PageInfo {
 }
 
 pub struct BwTreeEngine {
-    pub(crate) vnodes: ArcSwap<HashMap<usize, (PageId, PageType)>>,
-    // use for just created vnode.
-    pub(crate) buffer_page: RwLock<HashMap<usize, DeltaChain>>,
+    pub(crate) vnodes_map: RwLock<HashMap<usize, (PageId, PageType)>>,
     pub(crate) page_mapping: Arc<MappingTable>,
     pub(crate) page_id_manager: Arc<dyn PageIdGenerator>,
     pub(crate) page_store: PageStore,
@@ -76,14 +75,13 @@ impl BwTreeEngine {
         options: EngineOptions,
     ) -> Self {
         Self {
-            vnodes: ArcSwap::new(Arc::new(vnodes)),
-            buffer_page: RwLock::new(HashMap::default()),
+            vnodes_map: RwLock::new(vnodes),
+            gc_collector: GcPageCollector::new(page_mapping.clone()),
             page_mapping,
             page_id_manager,
             page_store,
             options,
             updates: Mutex::new(HashMap::default()),
-            gc_collector: GcPageCollector::default(),
         }
     }
 
@@ -94,21 +92,14 @@ impl BwTreeEngine {
     ) -> HummockResult<Option<Bytes>> {
         let _guard = self.gc_collector.get_snapshot();
         let vnode_id = get_vnode_id(&table_key.0);
-        let vnodes = self.vnodes.load();
-        match vnodes.get(&vnode_id) {
+        let pinfo = self.vnodes_map.read().get(&vnode_id).cloned();
+        match pinfo {
             Some((page_id, ptp)) => match ptp {
-                PageType::Index => self.search_index_page(table_key, page_id, epoch).await,
-                PageType::Leaf => self.search_data_page(table_key, *page_id, epoch).await,
+                PageType::Index => self.search_index_page(table_key, &page_id, epoch).await,
+                PageType::Leaf => self.search_data_page(table_key, page_id, epoch).await,
             },
             None => {
-                let guard = self.buffer_page.read();
-                let vnode_page = if let Some(page) = guard.get(&vnode_id) {
-                    page
-                } else {
-                    return Ok(None);
-                };
-                let vk = StateTableKey::new(table_key, epoch);
-                Ok(vnode_page.get(vk))
+                return Ok(None);
             }
         }
     }
@@ -125,7 +116,7 @@ impl BwTreeEngine {
     ) -> HummockResult<usize> {
         let _guard = self.gc_collector.get_snapshot();
         let mut dirty_pages = vec![];
-        let vnodes = self.vnodes.load_full();
+        let mut dirty_vnodes = vec![];
         let mut flush_size = 0;
         let partitioned_data = kv_pairs
             .into_iter()
@@ -133,36 +124,31 @@ impl BwTreeEngine {
             .into_iter()
             .map(|(k, v)| (k, v.collect::<VecDeque<_>>()))
             .collect_vec();
-        for (vnode_id, mut kvs) in partitioned_data {
-            let mut pinfo = match vnodes.get(&vnode_id) {
-                Some(pid) => *pid,
+        let mut page_ids = vec![];
+        {
+            let vnodes_map = self.vnodes_map.read();
+            for (vnode_id, _) in &partitioned_data {
+                page_ids.push(vnodes_map.get(vnode_id).cloned());
+            }
+        }
+        for ((vnode_id, mut kvs), pinfo_ret) in partitioned_data.into_iter().zip(page_ids) {
+            let mut pinfo = match pinfo_ret {
+                Some(pid) => pid,
                 None => {
-                    let mut guard = self.buffer_page.write();
-                    // get page again inside write-lock to avoid other thread has replace vnode-map.
-                    match self.vnodes.load().get(&vnode_id) {
-                        Some(pid) => *pid,
-                        None => {
-                            match guard.get_mut(&vnode_id) {
-                                Some(delta_chain) => {
-                                    flush_size += self.ingest_batch(
-                                        delta_chain,
-                                        kvs.into_iter().collect_vec(),
-                                        write_options.epoch,
-                                        write_options.table_id,
-                                    );
-                                }
-                                None => {
-                                    let (delta_chain, sz) = self.create_leaf_page(
-                                        kvs.into_iter().collect_vec(),
-                                        write_options.epoch,
-                                    );
-                                    flush_size += sz;
-                                    guard.insert(vnode_id, delta_chain);
-                                }
-                            }
-                            continue;
-                        }
-                    }
+                    let pid = self.get_new_page_id().await?;
+                    let (delta_chain, sz) = self.create_leaf_page(
+                        pid,
+                        kvs.into_iter().collect_vec(),
+                        write_options.epoch,
+                        write_options.table_id,
+                    );
+                    flush_size += sz;
+                    self.page_mapping.insert_delta(pid, delta_chain);
+                    dirty_pages.push((vnode_id, pid));
+                    dirty_vnodes.push((vnode_id, pid));
+                    let mut guard = self.vnodes_map.write();
+                    guard.insert(vnode_id, (pid, PageType::Leaf));
+                    continue;
                 }
             };
             let mut parent_page_id = INVALID_PAGE_ID;
@@ -217,9 +203,13 @@ impl BwTreeEngine {
                 }
             }
         }
-        self.updates
-            .lock()
-            .insert(write_options.epoch, DirtyPageUpdates { pages: dirty_pages });
+        self.updates.lock().insert(
+            write_options.epoch,
+            DirtyPageUpdates {
+                pages: dirty_pages,
+                vnodes: dirty_vnodes,
+            },
+        );
         Ok(flush_size)
     }
 
@@ -274,10 +264,25 @@ impl BwTreeEngine {
         }
     }
 
-    fn create_leaf_page(&self, kvs: Vec<(Bytes, StorageValue)>, epoch: u64) -> (DeltaChain, usize) {
-        let page = LeafPage::build(INVALID_PAGE_ID, kvs, Bytes::new(), Bytes::new(), epoch);
-        let sz = page.page_size();
-        let chain = DeltaChain::new(Arc::new(page));
+    fn create_leaf_page(
+        &self,
+        pid: PageId,
+        kvs: Vec<(Bytes, StorageValue)>,
+        epoch: u64,
+        table_id: TableId,
+    ) -> (DeltaChain, usize) {
+        let page = LeafPage::empty(pid, epoch);
+        let mut chain = DeltaChain::new(Arc::new(page));
+        let items = SharedBufferBatch::build_shared_buffer_item_batches(kvs);
+        let sz = SharedBufferBatch::measure_batch_size(&items);
+        chain.ingest(SharedBufferBatch::build_shared_buffer_batch(
+            epoch,
+            items,
+            sz,
+            vec![],
+            table_id,
+            None,
+        ));
         (chain, sz)
     }
 
