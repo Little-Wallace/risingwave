@@ -13,17 +13,14 @@
 // limitations under the License.
 
 use std::cmp::Ordering;
-use std::io::Read;
 use std::ops::Range;
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use risingwave_hummock_sdk::KeyComparator;
-use zstd::zstd_safe::WriteBuf;
-use {lz4, zstd};
 
-use crate::hummock::sstable::utils::{xxhash64_verify, CompressionAlgorithm};
+use crate::hummock::sstable::utils::xxhash64_verify;
 use crate::hummock::value::HummockValue;
-use crate::hummock::{HummockError, HummockResult};
+use crate::hummock::HummockResult;
 
 #[derive(Clone)]
 pub struct SortedRecordBlock {
@@ -46,45 +43,18 @@ impl SortedRecordBlock {
         }
     }
 
-    pub fn decode(buf: Bytes, uncompressed_capacity: usize) -> HummockResult<Self> {
+    pub fn decode(buf: Bytes) -> HummockResult<Self> {
         // Verify checksum.
         let xxhash64_checksum = (&buf[buf.len() - 8..]).get_u64_le();
         xxhash64_verify(&buf[..buf.len() - 8], xxhash64_checksum)?;
-
-        // Decompress.
-        let compression = CompressionAlgorithm::decode(&mut &buf[buf.len() - 9..buf.len() - 8])?;
-        let compressed_data = &buf[..buf.len() - 9];
-        let buf = match compression {
-            CompressionAlgorithm::None => buf.slice(0..(buf.len() - 9)),
-            CompressionAlgorithm::Lz4 => {
-                let mut decoder = lz4::Decoder::new(compressed_data.reader())
-                    .map_err(HummockError::decode_error)?;
-                let mut decoded = Vec::with_capacity(uncompressed_capacity);
-                decoder
-                    .read_to_end(&mut decoded)
-                    .map_err(HummockError::decode_error)?;
-                debug_assert_eq!(decoded.capacity(), uncompressed_capacity);
-                Bytes::from(decoded)
-            }
-            CompressionAlgorithm::Zstd => {
-                let mut decoder = zstd::Decoder::new(compressed_data.reader())
-                    .map_err(HummockError::decode_error)?;
-                let mut decoded = Vec::with_capacity(uncompressed_capacity);
-                decoder
-                    .read_to_end(&mut decoded)
-                    .map_err(HummockError::decode_error)?;
-                debug_assert_eq!(decoded.capacity(), uncompressed_capacity);
-                Bytes::from(decoded)
-            }
-        };
-
-        Ok(Self::decode_from_raw(buf))
+        let origin_len = buf.len() - 8;
+        Ok(Self::decode_from_raw(buf, origin_len))
     }
 
-    pub fn decode_from_raw(data: Bytes) -> Self {
+    pub fn decode_from_raw(data: Bytes, origin_len: usize) -> Self {
         // Decode restart points.
-        let raw_data_len = data.len() - 8;
-        let mut buf = &data.as_slice()[raw_data_len..];
+        let raw_data_len = origin_len - 8;
+        let mut buf = &data.as_ref()[raw_data_len..origin_len];
         let n_restarts = buf.get_u32_le();
         let record_count = buf.get_u32_le() as usize;
         let data_len = raw_data_len - n_restarts as usize * 4;

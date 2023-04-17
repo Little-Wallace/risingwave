@@ -50,7 +50,7 @@ impl LeafPage {
             raw_key.clear();
             raw_value.clear();
         }
-        let raw = SortedRecordBlock::decode(builder.build(), 0).unwrap();
+        let raw = SortedRecordBlock::decode(builder.build()).unwrap();
         LeafPage::new(pid, smallest_user_key, largest_user_key, raw, epoch)
     }
 
@@ -88,15 +88,13 @@ impl LeafPage {
         Bytes::copy_from_slice(user_key(iter.key()))
     }
 
-    pub fn get(&self, key: StateTableKey<Bytes>) -> Option<Bytes> {
+    pub fn get(&self, key: &[u8], ukey: &[u8]) -> Option<Bytes> {
         if self.raw.is_empty() {
             return None;
         }
-        let mut raw_key = BytesMut::default();
-        key.encode_into(&mut raw_key);
         let mut iter = BlockIterator::new(&self.raw);
-        iter.seek(&raw_key);
-        if iter.is_valid() && user_key(iter.key()).eq(key.user_key.as_ref()) {
+        iter.seek(key);
+        if iter.is_valid() && user_key(iter.key()).eq(ukey) {
             let v = iter.value().to_bytes();
             return v.into_user_value();
         }
@@ -128,20 +126,5 @@ impl LeafPage {
             return false;
         }
         true
-    }
-
-    pub fn fetch_overlap_mem_delta(&self, batches: &[SharedBufferBatch]) -> Vec<SharedBufferBatch> {
-        let mut mem_deltas = vec![];
-        for batch in batches {
-            if self.smallest_user_key.as_ref().le(batch.end_table_key().0)
-                && self.largest_user_key.as_ref().gt(batch.start_table_key().0)
-            {
-                mem_deltas.push(batch.copy_batch_between_range(
-                    self.smallest_user_key.as_ref(),
-                    self.largest_user_key.as_ref(),
-                ));
-            }
-        }
-        mem_deltas
     }
 }

@@ -6,8 +6,8 @@ use risingwave_hummock_sdk::key::{StateTableKey, TableKey};
 use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::storage_value::StorageValue;
 
-pub fn from_slice_key(key: &[u8], epoch: u64) -> StateTableKey<Bytes> {
-    StateTableKey::new(TableKey(Bytes::copy_from_slice(key)), epoch)
+pub fn from_slice_key(key: &[u8], epoch: u64) -> Vec<u8> {
+    StateTableKey::new(TableKey(Bytes::copy_from_slice(key)), epoch).encode()
 }
 
 pub fn generate_data(key: &[u8], value: &[u8]) -> (Bytes, StorageValue) {
@@ -39,13 +39,4 @@ pub fn generate_data_with_partition(
         StorageValue::new(Some(Bytes::copy_from_slice(value)))
     };
     (k, v)
-}
-
-pub fn build_shared_buffer_batch(
-    data: Vec<(Bytes, StorageValue)>,
-    epoch: u64,
-) -> SharedBufferBatch {
-    let items = SharedBufferBatch::build_shared_buffer_item_batches(data);
-    let sz = SharedBufferBatch::measure_batch_size(&items);
-    SharedBufferBatch::build_shared_buffer_batch(epoch, items, sz, vec![], TableId::new(1), None)
 }

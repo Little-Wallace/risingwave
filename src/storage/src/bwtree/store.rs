@@ -43,7 +43,7 @@ impl BwTreeEngineCore {
             let handle = tokio::spawn(async move {
                 // TODO: we must calculate min snapshot as the safe epoch to delete history version
                 // safely.
-                root.flush_dirty_pages_before(epoch, epoch).await
+                root.flush_shared_buffer(epoch, epoch).await
             });
             tasks.push(handle);
         }
@@ -80,7 +80,7 @@ impl LocalBwTreeStore {
         kv_pairs: Vec<(Bytes, StorageValue)>,
         write_options: WriteOptions,
     ) -> StorageResult<usize> {
-        let sz = self.page.flush(kv_pairs, write_options).await?;
+        let sz = self.page.ingest_batch(kv_pairs, write_options);
         Ok(sz)
     }
 

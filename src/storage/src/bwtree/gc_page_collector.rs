@@ -1,11 +1,9 @@
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::Mutex;
 
-use crate::bwtree::delta_chain::DeltaChain;
-use crate::bwtree::index_page::IndexPageHolder;
-use crate::bwtree::mapping_table::{MappingTable, PageHolder};
+use crate::bwtree::mapping_table::MappingTable;
 use crate::bwtree::PageId;
 
 #[derive(Default)]

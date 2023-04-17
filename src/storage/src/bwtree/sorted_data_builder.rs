@@ -4,7 +4,7 @@ use bytes::{BufMut, Bytes, BytesMut};
 use risingwave_hummock_sdk::KeyComparator;
 
 use super::sorted_record_block::KeyPrefix;
-use crate::hummock::sstable::utils::{xxhash64_checksum, CompressionAlgorithm};
+use crate::hummock::sstable::utils::xxhash64_checksum;
 use crate::hummock::HummockError;
 
 pub const SPLIT_LEAF_CAPACITY: usize = 50 * 1024;
@@ -14,8 +14,6 @@ pub const DEFAULT_ENTRY_SIZE: usize = 24; // table_id(u64) + primary_key(u64) + 
 pub struct BlockBuilderOptions {
     /// Reserved bytes size when creating buffer to avoid frequent allocating.
     pub capacity: usize,
-    /// Compression algorithm.
-    pub compression_algorithm: CompressionAlgorithm,
     /// Restart point interval.
     pub restart_interval: usize,
 }
@@ -24,7 +22,6 @@ impl Default for BlockBuilderOptions {
     fn default() -> Self {
         Self {
             capacity: SPLIT_LEAF_CAPACITY,
-            compression_algorithm: CompressionAlgorithm::None,
             restart_interval: DEFAULT_RESTART_INTERVAL,
         }
     }
@@ -42,8 +39,6 @@ pub struct BlockBuilder {
     last_key: Vec<u8>,
     /// Count of entries in current block.
     entry_count: usize,
-    /// Compression algorithm.
-    compression_algorithm: CompressionAlgorithm,
 }
 
 impl Default for BlockBuilder {
@@ -63,7 +58,6 @@ impl BlockBuilder {
             ),
             last_key: vec![],
             entry_count: 0,
-            compression_algorithm: options.compression_algorithm,
         }
     }
 
@@ -139,39 +133,6 @@ impl BlockBuilder {
         }
         self.buf.put_u32_le(self.restart_points.len() as u32);
         self.buf.put_u32_le(self.entry_count as u32);
-        match self.compression_algorithm {
-            CompressionAlgorithm::None => (),
-            CompressionAlgorithm::Lz4 => {
-                let mut encoder = lz4::EncoderBuilder::new()
-                    .level(4)
-                    .build(BytesMut::with_capacity(self.buf.len()).writer())
-                    .map_err(HummockError::encode_error)
-                    .unwrap();
-                encoder
-                    .write_all(&self.buf[..])
-                    .map_err(HummockError::encode_error)
-                    .unwrap();
-                let (writer, result) = encoder.finish();
-                result.map_err(HummockError::encode_error).unwrap();
-                self.buf = writer.into_inner();
-            }
-            CompressionAlgorithm::Zstd => {
-                let mut encoder =
-                    zstd::Encoder::new(BytesMut::with_capacity(self.buf.len()).writer(), 4)
-                        .map_err(HummockError::encode_error)
-                        .unwrap();
-                encoder
-                    .write_all(&self.buf[..])
-                    .map_err(HummockError::encode_error)
-                    .unwrap();
-                let writer = encoder
-                    .finish()
-                    .map_err(HummockError::encode_error)
-                    .unwrap();
-                self.buf = writer.into_inner();
-            }
-        };
-        self.compression_algorithm.encode(&mut self.buf);
         let checksum = xxhash64_checksum(&self.buf);
         self.buf.put_u64_le(checksum);
         self.buf.freeze()
@@ -212,7 +173,7 @@ mod tests {
             raw_value.clear();
         }
         let ret = builder.build();
-        let block = SortedRecordBlock::decode(ret, 0).unwrap();
+        let block = SortedRecordBlock::decode(ret).unwrap();
         let mut iter = block.iter();
         iter.seek_to_first();
         let mut idx = 0;

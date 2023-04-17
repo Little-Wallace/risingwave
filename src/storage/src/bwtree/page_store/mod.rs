@@ -1,4 +1,7 @@
+use risingwave_hummock_sdk::LocalSstableInfo;
+
 use crate::bwtree::leaf_page::LeafPage;
+use crate::bwtree::smo::CheckpointData;
 use crate::bwtree::PageId;
 use crate::hummock::HummockResult;
 
