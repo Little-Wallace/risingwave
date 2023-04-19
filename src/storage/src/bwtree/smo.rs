@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_recursion::async_recursion;
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
 use risingwave_hummock_sdk::key::get_vnode_id;
 
@@ -35,6 +35,20 @@ pub struct SMORedoLogRecord {
     smo_kind: u8,
 }
 
+impl SMORedoLogRecord {
+    pub fn encode_into(&self, buf: &mut impl BufMut) {
+        buf.put_u32_le(self.origin_pages.len() as u32);
+        for pid in &self.origin_pages {
+            buf.put_u64_le(*pid);
+        }
+        for pid in &self.new_pages {
+            buf.put_u64_le(*pid);
+        }
+        buf.put_u32_le(self.new_pages.len() as u32);
+        buf.put_u8(self.smo_kind);
+    }
+}
+
 #[derive(Clone)]
 pub struct IndexPageRedoLogRecord {
     // only for replay.
@@ -44,8 +58,23 @@ pub struct IndexPageRedoLogRecord {
     pub smo_pages_height: usize,
 }
 
+impl IndexPageRedoLogRecord {
+    pub fn encode_into(&self, buf: &mut impl BufMut) {
+        buf.put_u32_le(self.redo_logs.len() as u32);
+        for log in &self.redo_logs {
+            log.encode_into(buf);
+        }
+        buf.put_u32_le(self.deltas.len() as u32);
+        for delta in &self.deltas {
+            delta.encode_into(buf);
+        }
+        buf.put_u64_le(self.update_page_id);
+        buf.put_u64_le(self.smo_pages_height as u64);
+    }
+}
+
 pub struct CheckpointData {
-    pub leaf_deltas: Vec<(PageId, Arc<Delta>)>,
+    pub leaf_deltas: Vec<(PageId, u64, Arc<Delta>)>,
     pub leaf: Vec<Arc<LeafPage>>,
     pub index: Vec<(PageId, Bytes)>,
     pub index_redo_log: Vec<IndexPageRedoLogRecord>,
@@ -64,7 +93,13 @@ impl BwTreeEngine {
         checkpoint: &mut CheckpointData,
     ) -> HummockResult<IndexPageRedoLogRecord> {
         let delta_chains = self.get_leaf_page_delta(current_page).await?;
-        let largest_key = delta_chains.read().get_page_ref().largest_user_key.clone();
+        let (largest_key, last_epoch) = {
+            let guard = delta_chains.read();
+            (
+                guard.get_page_ref().largest_user_key.clone(),
+                guard.last_epoch(),
+            )
+        };
         let mut builder = BlockBuilder::default();
         let mut raw_key = BytesMut::new();
         let mut raw_value = BytesMut::new();
@@ -89,7 +124,7 @@ impl BwTreeEngine {
             update_page_id: 0,
             smo_pages_height: 0,
         };
-        let delta = Arc::new(Delta::new(builder.build(), epoch, epoch));
+        let delta = Arc::new(Delta::new(builder.build(), last_epoch, epoch));
         delta_chains.write().ingest(delta.clone());
         let (new_pages, origin_page_right_link) = {
             let dirty_page = delta_chains.read();
@@ -106,7 +141,9 @@ impl BwTreeEngine {
                     origin_page_right_link,
                 )
             } else {
-                checkpoint.leaf_deltas.push((current_page, delta));
+                checkpoint
+                    .leaf_deltas
+                    .push((current_page, last_epoch, delta));
                 return Ok(record);
             }
         };
@@ -141,6 +178,7 @@ impl BwTreeEngine {
             ));
             leaf_pages.push(p);
         }
+        checkpoint.leaf.extend(leaf_pages);
         if page_count > 1 {
             record.redo_logs.push(SMORedoLogRecord {
                 origin_pages: vec![current_page],
@@ -182,12 +220,24 @@ impl BwTreeEngine {
             smo_pages_height: 0,
             update_page_id: current_page,
         };
-        let sons = {
+        let mut sons = vec![];
+        {
             let read_guard = index_delta_chain.read();
             meet_leaf = read_guard.get_base_page().get_height() == 1;
             record.smo_pages_height = read_guard.get_base_page().get_height() - 1;
-            read_guard.get_base_page().get_sub_tree()
-        };
+            let sub_tree = read_guard.get_base_page().get_sub_tree();
+            // use largest key
+            for idx in 0..sub_tree.len() {
+                if idx + 1 == sub_tree.len() {
+                    sons.push((
+                        read_guard.get_base_page().get_largest_key(),
+                        sub_tree[idx].1,
+                    ));
+                } else {
+                    sons.push((sub_tree[idx + 1].0.clone(), sub_tree[idx].1));
+                }
+            }
+        }
         for (largest_key, pid) in sons {
             if !iter.is_valid() {
                 break;
@@ -258,7 +308,7 @@ impl BwTreeEngine {
                 new_record.deltas.push(IndexPageDelta {
                     son: SubtreePageInfo {
                         page_id: new_page_id,
-                        largest_key: page.get_largest_key(),
+                        smallest_key: page.get_smallest_key(),
                     },
                     epoch,
                     smo: SMOType::Add,
@@ -278,7 +328,7 @@ impl BwTreeEngine {
             new_record.deltas.push(IndexPageDelta {
                 son: SubtreePageInfo {
                     page_id: first_page.get_page_id(),
-                    largest_key: first_page.get_largest_key(),
+                    smallest_key: first_page.get_smallest_key(),
                 },
                 epoch,
                 smo: SMOType::Add,
@@ -323,7 +373,7 @@ impl BwTreeEngine {
             shared_buffer.iter(epoch)
         };
         iter.seek_to_first();
-        let vnodes_map = self.vnodes_map.load();
+        let mut vnodes_map = self.vnodes_map.load_full().as_ref().clone();
         while iter.is_valid() {
             let last_vnode_id = get_vnode_id(&iter.key().user_key);
             match vnodes_map.get(&last_vnode_id) {
@@ -355,21 +405,32 @@ impl BwTreeEngine {
                     if record.deltas.is_empty() && record.redo_logs.is_empty() {
                         continue;
                     }
-                    let new_pid = self.page_id_manager.get_new_page_id().await?;
-                    let index_page =
-                        IndexPage::new(new_pid, Bytes::new(), epoch, record.smo_pages_height + 1);
-                    let chain = IndexPageDeltaChain::create(record.deltas.clone(), index_page);
-                    self.page_mapping.insert_index_delta(new_pid, chain.clone());
-                    checkpoint
-                        .index
-                        .push((new_pid, chain.write().reconsile(epoch)));
-                    assert_eq!(record.redo_logs.len(), 1);
-                    record.redo_logs.last_mut().unwrap().smo_kind = SMO_CREATE_ROOT_PAGE;
-                    record.update_page_id = new_pid;
+                    if record.deltas.len() > 1 {
+                        let new_pid = self.page_id_manager.get_new_page_id().await?;
+                        let index_page = IndexPage::new(
+                            new_pid,
+                            Bytes::new(),
+                            epoch,
+                            record.smo_pages_height + 1,
+                        );
+                        let chain = IndexPageDeltaChain::create(record.deltas.clone(), index_page);
+                        self.page_mapping.insert_index_delta(new_pid, chain.clone());
+                        checkpoint
+                            .index
+                            .push((new_pid, chain.write().reconsile(epoch)));
+                        assert_eq!(record.redo_logs.len(), 1);
+                        record.redo_logs.last_mut().unwrap().smo_kind = SMO_CREATE_ROOT_PAGE;
+                        record.update_page_id = new_pid;
+                        checkpoint
+                            .vnodes
+                            .insert(last_vnode_id, (new_pid, PageType::Index));
+                    } else {
+                        record.redo_logs.last_mut().unwrap().smo_kind = SMO_RECONCILE;
+                        checkpoint
+                            .vnodes
+                            .insert(last_vnode_id, (*pid, PageType::Index));
+                    }
                     checkpoint.index_redo_log.push(record);
-                    checkpoint
-                        .vnodes
-                        .insert(last_vnode_id, (new_pid, PageType::Index));
                 }
                 None => {
                     let pid = self.get_new_page_id().await?;
@@ -396,6 +457,14 @@ impl BwTreeEngine {
                 }
             }
         }
+
+        if !checkpoint.vnodes.is_empty() {
+            for (k, v) in checkpoint.vnodes.iter() {
+                vnodes_map.insert(*k, *v);
+            }
+            self.vnodes_map.store(Arc::new(vnodes_map));
+        }
+
         // these data has been written into btree.
         self.shared_buffer.write().commit(epoch);
         self.gc_collector.refresh_for_gc();
@@ -435,7 +504,7 @@ impl BwTreeEngine {
             removed_delta.push(IndexPageDelta {
                 son: SubtreePageInfo {
                     page_id: page.get_page_ref().get_page_id(),
-                    largest_key: page.get_page_ref().largest_user_key.clone(),
+                    smallest_key: page.get_page_ref().smallest_user_key.clone(),
                 },
                 smo: SMOType::Remove,
                 epoch,
@@ -470,7 +539,7 @@ impl BwTreeEngine {
             removed_delta.push(IndexPageDelta {
                 son: SubtreePageInfo {
                     page_id: page.get_base_page().get_page_id(),
-                    largest_key: page.get_base_page().get_largest_key(),
+                    smallest_key: page.get_base_page().get_smallest_key(),
                 },
                 smo: SMOType::Remove,
                 epoch,

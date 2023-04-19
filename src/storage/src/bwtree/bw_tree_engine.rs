@@ -15,7 +15,7 @@ use crate::bwtree::index_page::PageType;
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::mapping_table::MappingTable;
 use crate::bwtree::page_id_generator::PageIdGenerator;
-use crate::bwtree::page_store::PageStore;
+use crate::bwtree::page_store::{PageStore, PageStoreRef};
 use crate::bwtree::{PageId, INVALID_PAGE_ID};
 use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::value::HummockValue;
@@ -99,7 +99,7 @@ pub struct BwTreeEngine {
     pub(crate) vnodes_map: ArcSwap<HashMap<usize, (PageId, PageType)>>,
     pub(crate) page_mapping: Arc<MappingTable>,
     pub(crate) page_id_manager: Arc<dyn PageIdGenerator>,
-    pub(crate) page_store: PageStore,
+    pub(crate) page_store: PageStoreRef,
     pub(crate) updates: Mutex<HashMap<u64, DirtyPageUpdates>>,
     pub(crate) options: EngineOptions,
     pub(crate) gc_collector: GcPageCollector,
@@ -111,7 +111,7 @@ impl BwTreeEngine {
         vnodes: HashMap<usize, (PageId, PageType)>,
         page_mapping: Arc<MappingTable>,
         page_id_manager: Arc<dyn PageIdGenerator>,
-        page_store: PageStore,
+        page_store: PageStoreRef,
         options: EngineOptions,
     ) -> Self {
         Self {
@@ -282,7 +282,7 @@ mod tests {
             HashMap::default(),
             Arc::new(MappingTable::new(1, 1024)),
             Arc::new(LocalPageIdGenerator::default()),
-            PageStore {},
+            PageStore::for_test(),
             EngineOptions {
                 leaf_split_size: 150,
                 leaf_reconcile_size: 50,
@@ -341,7 +341,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(v.unwrap().as_ref(), b"v2");
-        println!("==================================");
         let mut new_data = vec![];
         for i in 20..40u64 {
             prefix.extend_from_slice(&i.to_le_bytes());
@@ -352,6 +351,13 @@ mod tests {
         engine.ingest_batch(new_data, write_options.clone());
         // Flush and split the origin page. It would generate the first index-page.
         let data = engine.flush_shared_buffer(4, 4).await.unwrap();
-        assert_eq!(data.leaf.len(), 5);
+        assert_eq!(data.leaf.len(), 3);
+        assert_eq!(data.vnodes.len(), 1);
+        prefix.extend_from_slice(&1u64.to_le_bytes());
+        let v = engine
+            .get(TableKey(get_key_with_partition(0, &prefix)), 3)
+            .await
+            .unwrap();
+        assert_eq!(v.unwrap().as_ref(), b"v2");
     }
 }

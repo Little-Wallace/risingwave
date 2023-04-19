@@ -20,7 +20,7 @@ use risingwave_hummock_sdk::KeyComparator;
 
 use crate::hummock::sstable::utils::xxhash64_verify;
 use crate::hummock::value::HummockValue;
-use crate::hummock::HummockResult;
+use crate::hummock::{CompressionAlgorithm, HummockResult};
 
 #[derive(Clone)]
 pub struct SortedRecordBlock {
@@ -128,6 +128,10 @@ impl SortedRecordBlock {
 
     pub fn iter<'a>(&'a self) -> BlockIterator<'a> {
         BlockIterator::new(self)
+    }
+
+    pub fn compress(&self, _algorithm: CompressionAlgorithm) -> Bytes {
+        self.data.clone()
     }
 }
 

@@ -11,22 +11,35 @@ use crate::bwtree::sorted_data_builder::{
 };
 use crate::bwtree::sorted_record_block::{BlockIterator, SortedRecordBlock};
 use crate::bwtree::INVALID_PAGE_ID;
+use crate::hummock::CompressionAlgorithm;
 
 const SPLIT_LEAF_CAPACITY: usize = 50 * 1024;
 
 pub struct Delta {
     raw: SortedRecordBlock,
-    min_epoch: u64,
+    prev_epoch: u64,
     max_epoch: u64,
 }
 
 impl Delta {
-    pub fn new(data: Bytes, min_epoch: u64, max_epoch: u64) -> Self {
+    pub fn new(data: Bytes, prev_epoch: u64, max_epoch: u64) -> Self {
         Self {
             raw: SortedRecordBlock::decode(data).unwrap(),
-            min_epoch,
+            prev_epoch,
             max_epoch,
         }
+    }
+
+    pub fn max_epoch(&self) -> u64 {
+        self.max_epoch
+    }
+
+    pub fn prev_epoch(&self) -> u64 {
+        self.prev_epoch
+    }
+
+    pub fn data(&self) -> Bytes {
+        self.raw.compress(CompressionAlgorithm::None)
     }
 }
 
@@ -69,6 +82,13 @@ impl DeltaChain {
 
     pub fn get_page_ref(&self) -> &LeafPage {
         self.base_page.as_ref()
+    }
+
+    pub fn last_epoch(&self) -> u64 {
+        if let Some(d) = self.syncing_deltas.last() {
+            return d.max_epoch;
+        }
+        self.base_page.as_ref().epoch()
     }
 
     pub fn get(&self, vk: &[u8], ukey: &[u8], epoch: u64) -> Option<Bytes> {

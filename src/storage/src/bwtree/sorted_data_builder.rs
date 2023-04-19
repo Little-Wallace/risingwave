@@ -143,6 +143,10 @@ impl BlockBuilder {
         // block + restart_points + restart_points.len + compression_algorithm + checksum
         self.buf.len() + 4 * self.restart_points.len() + 4 + 1 + 8
     }
+
+    pub fn count(&self) -> usize {
+        self.entry_count
+    }
 }
 
 #[cfg(test)]

@@ -6,6 +6,7 @@ use crate::bwtree::sorted_record_block::{BlockIterator, SortedRecordBlock};
 use crate::bwtree::{PageId, INVALID_PAGE_ID};
 use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::value::HummockValue;
+use crate::hummock::CompressionAlgorithm;
 use crate::storage_value::StorageValue;
 
 const RIGHT_SPLIT_SIZE: usize = 32 * 1024;
@@ -29,6 +30,14 @@ impl LeafPage {
             SortedRecordBlock::empty(),
             epoch,
         )
+    }
+
+    pub fn encode_size(&self) -> usize {
+        // page id, epoch, right_link  and size of and smallest_user_key and largest_user_key.
+        self.smallest_user_key.len()
+            + self.largest_user_key.len()
+            + std::mem::size_of::<u64>() * 3
+            + std::mem::size_of::<u32>() * 2
     }
 
     pub fn build(
@@ -92,6 +101,7 @@ impl LeafPage {
         if self.raw.is_empty() {
             return None;
         }
+        debug_assert!(ukey.ge(self.smallest_user_key.as_ref()));
         let mut iter = BlockIterator::new(&self.raw);
         iter.seek(key);
         if iter.is_valid() && user_key(iter.key()).eq(ukey) {
@@ -126,5 +136,9 @@ impl LeafPage {
             return false;
         }
         true
+    }
+
+    pub fn compress(&self, algorithm: CompressionAlgorithm) -> Bytes {
+        self.raw.compress(algorithm)
     }
 }
