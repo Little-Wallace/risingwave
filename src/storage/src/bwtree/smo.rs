@@ -74,7 +74,7 @@ impl IndexPageRedoLogRecord {
 }
 
 pub struct CheckpointData {
-    pub leaf_deltas: Vec<(PageId, u64, Arc<Delta>)>,
+    pub leaf_deltas: Vec<(PageId, Arc<Delta>)>,
     pub leaf: Vec<Arc<LeafPage>>,
     pub index: Vec<(PageId, Bytes)>,
     pub index_redo_log: Vec<IndexPageRedoLogRecord>,
@@ -141,9 +141,7 @@ impl BwTreeEngine {
                     origin_page_right_link,
                 )
             } else {
-                checkpoint
-                    .leaf_deltas
-                    .push((current_page, last_epoch, delta));
+                checkpoint.leaf_deltas.push((current_page, delta));
                 return Ok(record);
             }
         };

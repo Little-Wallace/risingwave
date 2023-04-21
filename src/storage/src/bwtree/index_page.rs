@@ -11,8 +11,8 @@ use crate::hummock::sstable::utils::get_length_prefixed_slice;
 
 #[derive(Eq, PartialEq, Clone, Copy, Debug)]
 pub enum PageType {
-    Index,
-    Leaf,
+    Index = 0,
+    Leaf = 1,
 }
 
 #[derive(Eq, PartialEq, Clone)]
@@ -23,7 +23,7 @@ pub struct SubtreePageInfo {
 }
 
 impl SubtreePageInfo {
-    pub fn encode_to(&self, buf: &mut BytesMut) {
+    pub fn encode_to(&self, buf: &mut impl BufMut) {
         buf.put_u64_le(self.page_id);
         buf.put_u32_le(self.smallest_key.len() as u32);
         buf.put_slice(self.smallest_key.as_ref());
@@ -191,10 +191,22 @@ impl IndexPage {
     }
 }
 
-#[derive(Eq, PartialEq, Clone)]
+#[derive(Eq, PartialEq, Clone, Copy)]
+#[repr(u8)]
 pub enum SMOType {
-    Add,
-    Remove,
+    Add = 0,
+    Remove = 1,
+    Unknown = 255,
+}
+
+impl SMOType {
+    fn try_from(v: u8) -> Self {
+        match v {
+            0 => SMOType::Add,
+            1 => SMOType::Remove,
+            _ => SMOType::Unknown,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -209,11 +221,24 @@ impl IndexPageDelta {
         Self {
             son: SubtreePageInfo {
                 page_id,
-                smallest_key: smallest_key,
+                smallest_key,
             },
             smo,
             epoch,
         }
+    }
+
+    pub fn encode_into(&self, buf: &mut impl BufMut) {
+        self.son.encode_to(buf);
+        buf.put_u8(self.smo as u8);
+        buf.put_u64_le(self.epoch);
+    }
+
+    pub fn decode_from(buf: &mut &[u8]) -> Self {
+        let son = SubtreePageInfo::decode_from(buf);
+        let smo = SMOType::try_from(buf.get_u8());
+        let epoch = buf.get_u64_le();
+        Self { son, smo, epoch }
     }
 }
 

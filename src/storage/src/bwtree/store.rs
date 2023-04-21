@@ -1,18 +1,27 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::future::Future;
 use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::try_join_all;
+use itertools::Itertools;
 use risingwave_common::catalog::TableId;
 use risingwave_common::util::epoch::INVALID_EPOCH;
+use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
 use risingwave_hummock_sdk::key::TableKey;
-use risingwave_hummock_sdk::HummockReadEpoch;
+use risingwave_hummock_sdk::table_stats::TableStatsMap;
+use risingwave_hummock_sdk::{HummockReadEpoch, LocalSstableInfo};
+use risingwave_pb::hummock::SstableInfo;
+use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::bwtree::bw_tree_engine::BwTreeEngine;
+use crate::bwtree::index_page::PageType;
+use crate::bwtree::page_id_generator::PageIdGenerator;
+use crate::bwtree::page_store::PageStoreRef;
+use crate::bwtree::PageId;
 use crate::error::StorageResult;
-use crate::hummock::HummockResult;
+use crate::hummock::{CompressionAlgorithm, HummockError, HummockResult};
 use crate::mem_table::{merge_stream, KeyOp, MemTable};
 use crate::storage_value::StorageValue;
 use crate::store::{
@@ -32,27 +41,77 @@ pub struct LocalBwTreeStore {
 
 pub struct BwTreeEngineCore {
     states: BTreeMap<TableId, Arc<BwTreeEngine>>,
+    page_store: PageStoreRef,
+    page_id_manager: Arc<dyn PageIdGenerator>,
 }
 
 impl BwTreeEngineCore {
     /// This method only allow one thread calling.
     pub async fn flush_dirty_pages_before(&self, epoch: u64) -> HummockResult<SyncResult> {
         let mut tasks = vec![];
-        for (_, page) in &self.states {
-            let root = page.clone();
-            let handle = tokio::spawn(async move {
+        for (table_id, state_table) in &self.states {
+            let table_id = *table_id;
+            let root = state_table.clone();
+            let store = self.page_store.clone();
+            let segment_id = self.page_id_manager.get_segment_id().await?;
+            // TODO: we could calculate the size of shared-buffer of each table and then group them
+            // to reduce write IO count.
+            let handle: JoinHandle<
+                HummockResult<(TableId, SstableInfo, HashMap<usize, (PageId, PageType)>)>,
+            > = tokio::spawn(async move {
                 // TODO: we must calculate min snapshot as the safe epoch to delete history version
                 // safely.
-                root.flush_shared_buffer(epoch, epoch).await
+                let checkpoint = root.flush_shared_buffer(epoch, epoch).await?;
+                let mut uploader = store
+                    .open_builder(segment_id, CompressionAlgorithm::None)
+                    .await?;
+                // TODO: we could flush some data to uploader during flush_shared_buffer, because we
+                // do not need wait all pages.
+                for page in checkpoint.leaf {
+                    uploader.append_page(page).await?;
+                }
+                for (pid, delta) in checkpoint.leaf_deltas {
+                    uploader.append_delta(pid, delta).await?;
+                }
+                for (pid, data) in checkpoint.index {
+                    uploader.append_index_page(pid, epoch, data).await?;
+                }
+                uploader.append_redo_log(checkpoint.index_redo_log).await?;
+                let sst_info = uploader.finish().await?;
+                Ok((table_id, sst_info, checkpoint.vnodes))
             });
             tasks.push(handle);
         }
         // TODO: retry or panic
-        let _ret = try_join_all(tasks).await;
+        let rets = try_join_all(tasks)
+            .await
+            .map_err(|_| HummockError::other("failed to finish sync task"))?;
+        let mut uncommitted_ssts = vec![];
+        let mut uncommitted_vnode_maps = vec![];
+        for ret in rets {
+            let (table_id, sst_info, vnodes_map) = ret?;
+            uncommitted_ssts.push(LocalSstableInfo::new(
+                StaticCompactionGroupId::StateDefault.into(),
+                sst_info,
+                TableStatsMap::default(),
+            ));
+            if !vnodes_map.is_empty() {
+                let mut vnode_info = vnodes_map
+                    .into_iter()
+                    .map(|(vnode_id, (pid, ptype))| {
+                        let v = ptype as u8;
+                        (vnode_id, pid, v)
+                    })
+                    .collect_vec();
+                vnode_info.sort_by_key(|x| x.0);
+                uncommitted_vnode_maps.push((table_id, vnode_info));
+            }
+        }
+
         Ok(SyncResult {
             sync_size: 0,
-            // TODO: convert object to sstable info.
-            uncommitted_ssts: vec![],
+            // uncommitted_vnode_maps
+            uncommitted_ssts,
         })
     }
 }
