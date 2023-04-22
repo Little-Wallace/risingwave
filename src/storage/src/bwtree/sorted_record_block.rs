@@ -102,14 +102,6 @@ impl SortedRecordBlock {
         self.restart_points.len()
     }
 
-    /// Searches the index of the restart point that the given `offset` belongs to.
-    pub fn search_restart_point(&self, offset: usize) -> usize {
-        // Find the largest restart point that equals or less than the given offset.
-        self.restart_points
-            .partition_point(|&position| position <= offset as u32)
-            .saturating_sub(1) // Prevent from underflowing when given is smaller than the first.
-    }
-
     /// Searches the index of the restart point by partition point.
     pub fn search_restart_partition_point<P>(&self, pred: P) -> usize
     where

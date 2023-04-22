@@ -1,11 +1,8 @@
-use std::io::Write;
-
 use bytes::{BufMut, Bytes, BytesMut};
 use risingwave_hummock_sdk::KeyComparator;
 
 use super::sorted_record_block::KeyPrefix;
 use crate::hummock::sstable::utils::xxhash64_checksum;
-use crate::hummock::HummockError;
 
 pub const SPLIT_LEAF_CAPACITY: usize = 50 * 1024;
 pub const DEFAULT_RESTART_INTERVAL: usize = 16;

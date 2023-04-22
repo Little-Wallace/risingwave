@@ -6,14 +6,14 @@ use bytes::{BufMut, Bytes, BytesMut};
 use parking_lot::RwLock;
 use risingwave_hummock_sdk::key::get_vnode_id;
 
+use crate::bwtree::base_page::BasePage;
 use crate::bwtree::bw_tree_engine::BwTreeEngine;
 use crate::bwtree::data_iterator::MergedSharedBufferIterator;
-use crate::bwtree::delta_chain::{Delta, DeltaChain};
 use crate::bwtree::index_page::{
     IndexPage, IndexPageDelta, IndexPageDeltaChain, IndexPageHolder, PageType, SMOType,
     SubtreePageInfo,
 };
-use crate::bwtree::leaf_page::LeafPage;
+use crate::bwtree::leaf_page::{Delta, LeafPage};
 use crate::bwtree::sorted_data_builder::BlockBuilder;
 use crate::bwtree::sorted_record_block::SortedRecordBlock;
 use crate::bwtree::{PageId, INVALID_PAGE_ID};
@@ -75,7 +75,7 @@ impl IndexPageRedoLogRecord {
 
 pub struct CheckpointData {
     pub leaf_deltas: Vec<(PageId, Arc<Delta>)>,
-    pub leaf: Vec<Arc<LeafPage>>,
+    pub leaf: Vec<Arc<BasePage>>,
     pub index: Vec<(PageId, Bytes)>,
     pub index_redo_log: Vec<IndexPageRedoLogRecord>,
     pub vnodes: HashMap<usize, (PageId, PageType)>,
@@ -92,14 +92,11 @@ impl BwTreeEngine {
         iter: &mut MergedSharedBufferIterator,
         checkpoint: &mut CheckpointData,
     ) -> HummockResult<IndexPageRedoLogRecord> {
-        let delta_chains = self.get_leaf_page_delta(current_page).await?;
-        let (largest_key, last_epoch) = {
-            let guard = delta_chains.read();
-            (
-                guard.get_page_ref().largest_user_key.clone(),
-                guard.last_epoch(),
-            )
-        };
+        let dirty_page = self.get_leaf_page_delta(current_page).await?;
+        let (largest_key, last_epoch) = (
+            dirty_page.get_base_page().largest_user_key.clone(),
+            dirty_page.last_epoch(),
+        );
         let mut builder = BlockBuilder::default();
         let mut raw_key = BytesMut::new();
         let mut raw_value = BytesMut::new();
@@ -125,15 +122,15 @@ impl BwTreeEngine {
             smo_pages_height: 0,
         };
         let delta = Arc::new(Delta::new(builder.build(), last_epoch, epoch));
-        delta_chains.write().ingest(delta.clone());
+        let mut origin_page = dirty_page.as_ref().clone();
+        origin_page.ingest(delta.clone());
         let (new_pages, origin_page_right_link) = {
-            let dirty_page = delta_chains.read();
-            let origin_page_right_link = dirty_page.get_page_ref().get_right_link();
-            if dirty_page.need_split(self.options.leaf_split_size)
-                || dirty_page.need_reconcile(self.options.leaf_reconcile_size)
+            let origin_page_right_link = origin_page.get_base_page().get_right_link();
+            if origin_page.need_split(self.options.leaf_split_size)
+                || origin_page.need_reconcile(self.options.leaf_reconcile_size)
             {
                 (
-                    dirty_page.apply_to_page(
+                    origin_page.apply_to_page(
                         self.options.leaf_split_size,
                         self.options.index_split_count / 2,
                         safe_epoch,
@@ -141,6 +138,8 @@ impl BwTreeEngine {
                     origin_page_right_link,
                 )
             } else {
+                self.page_mapping
+                    .insert_syncing_page(current_page, Arc::new(origin_page));
                 checkpoint.leaf_deltas.push((current_page, delta));
                 return Ok(record);
             }
@@ -159,22 +158,17 @@ impl BwTreeEngine {
             } else {
                 page.set_right_link(last_pid);
             }
-            let p = Arc::new(page);
-            if idx + 1 == page_count {
-                if page_count == 1 {
-                    self.page_mapping.insert_page(p.get_page_id(), p.clone());
-                    delta_chains.write().set_new_page(p.clone());
-                }
-            } else {
-                self.page_mapping.insert_page(p.get_page_id(), p.clone());
-            }
+            let base_page = Arc::new(page);
+            let p = Arc::new(LeafPage::new(base_page.clone()));
+            let current_pid = base_page.get_page_id();
+            self.page_mapping.insert_syncing_page(current_pid, p);
             record.deltas.push(IndexPageDelta::new(
                 SMOType::Add,
-                p.get_page_id(),
+                current_pid,
                 epoch,
-                p.smallest_user_key.clone(),
+                base_page.smallest_user_key.clone(),
             ));
-            leaf_pages.push(p);
+            leaf_pages.push(base_page);
         }
         checkpoint.leaf.extend(leaf_pages);
         if page_count > 1 {
@@ -447,8 +441,10 @@ impl BwTreeEngine {
                         iter.next();
                     }
                     let raw = SortedRecordBlock::decode(builder.build()).unwrap();
-                    let page = Arc::new(LeafPage::new(pid, Bytes::new(), Bytes::new(), raw, epoch));
-                    self.page_mapping.insert_page(pid, page.clone());
+                    let page = Arc::new(BasePage::new(pid, Bytes::new(), Bytes::new(), raw, epoch));
+                    checkpoint.leaf.push(page.clone());
+                    self.page_mapping
+                        .insert_syncing_page(pid, Arc::new(LeafPage::new(page)));
                     checkpoint
                         .vnodes
                         .insert(last_vnode_id, (pid, PageType::Leaf));
@@ -474,35 +470,31 @@ impl BwTreeEngine {
         epoch: u64,
         safe_epoch: u64,
         current_size: usize,
-        pages: &mut Vec<Arc<RwLock<DeltaChain>>>,
+        pages: &mut Vec<Arc<LeafPage>>,
         checkpoint: &mut CheckpointData,
     ) -> HummockResult<Vec<IndexPageDelta>> {
         // take the left page.
         let first_delta = pages.pop().unwrap();
         // reverse to keep page order same with key order.
         pages.reverse();
-        let new_page =
-            first_delta
-                .read()
-                .merge_pages(epoch, safe_epoch, current_size, pages.as_ref());
+        let new_page = first_delta.merge_pages(epoch, safe_epoch, current_size, pages.as_ref());
         let first_pid = new_page.get_page_id();
         let new_page = {
-            let mut guard = first_delta.write();
+            let mut guard = first_delta.as_ref().clone();
             let new_page = Arc::new(new_page);
-            guard.set_new_page(new_page.clone());
-            new_page
+            checkpoint.leaf.push(new_page.clone());
+            guard.set_new_page(new_page);
+            Arc::new(guard)
         };
-        checkpoint.leaf.push(new_page.clone());
-        self.page_mapping.insert_page(first_pid, new_page);
+        self.page_mapping.insert_syncing_page(first_pid, new_page);
         // TODO: remove page after all read-request ended. (we need a epoch-based algorithm to make
         // sure that no-threads would access these pages)
         let mut removed_delta = Vec::with_capacity(pages.len());
-        for delta_chains in pages.iter() {
-            let mut page = delta_chains.read();
+        for page in pages.iter() {
             removed_delta.push(IndexPageDelta {
                 son: SubtreePageInfo {
-                    page_id: page.get_page_ref().get_page_id(),
-                    smallest_key: page.get_page_ref().smallest_user_key.clone(),
+                    page_id: page.get_base_page().get_page_id(),
+                    smallest_key: page.get_base_page().smallest_user_key.clone(),
                 },
                 smo: SMOType::Remove,
                 epoch,
@@ -573,14 +565,11 @@ impl BwTreeEngine {
             // from right to left
             sub_pages.reverse();
             for pid in &sub_pages {
-                let delta = self.get_leaf_page_delta(*pid).await?;
-                let sz = {
-                    let guard = delta.read();
-                    guard.get_page_ref().page_size() + guard.update_size()
-                };
+                let page = self.get_leaf_page_delta(*pid).await?;
+                let sz = page.page_size();
                 if sz + current_size < self.options.index_min_merge_count {
                     current_size += sz;
-                    last_sons.push(delta);
+                    last_sons.push(page);
                     last_page_ids.push(*pid);
                 } else {
                     if last_sons.len() > 1 {
@@ -597,7 +586,7 @@ impl BwTreeEngine {
                     last_sons.clear();
                     last_page_ids.clear();
                     if sz < self.options.index_min_merge_count {
-                        last_sons.push(delta);
+                        last_sons.push(page);
                         last_page_ids.push(*pid);
                     }
                 }

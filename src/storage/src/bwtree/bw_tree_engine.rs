@@ -9,7 +9,6 @@ use risingwave_hummock_sdk::key::{get_vnode_id, StateTableKey, TableKey};
 use spin::Mutex;
 
 use crate::bwtree::data_iterator::MergedSharedBufferIterator;
-use crate::bwtree::delta_chain::DeltaChain;
 use crate::bwtree::gc_page_collector::GcPageCollector;
 use crate::bwtree::index_page::PageType;
 use crate::bwtree::leaf_page::LeafPage;
@@ -191,52 +190,17 @@ impl BwTreeEngine {
         let mut raw_key = BytesMut::new();
         vk.encode_into(&mut raw_key);
         loop {
-            match self.page_mapping.get_data_chains(&leaf_page_id) {
-                Some(delta) => {
-                    let guard = delta.read();
-                    if !guard.get_page_ref().check_valid_read(&vk.user_key) {
-                        leaf_page_id = guard.get_page_ref().get_right_link();
-                        continue;
-                    }
-                    return Ok(guard.get(&raw_key, vk.user_key.as_ref(), epoch));
-                }
-                None => {
-                    let leaf = match self.page_mapping.get_leaf_page(leaf_page_id) {
-                        Some(page) => page.value().clone(),
-                        None => self.get_leaf_page(leaf_page_id).await?,
-                    };
-                    if !leaf.check_valid_read(&vk.user_key) {
-                        leaf_page_id = leaf.get_right_link();
-                        continue;
-                    }
-                    return Ok(leaf.get(&raw_key, vk.user_key.as_ref()));
-                }
+            let leaf = self.page_mapping.get_or_fetch_page(leaf_page_id).await?;
+            if !leaf.get_base_page().check_valid_read(&vk.user_key) {
+                leaf_page_id = leaf.get_base_page().get_right_link();
+                continue;
             }
+            return Ok(leaf.get(&raw_key, vk.user_key.as_ref(), epoch));
         }
     }
 
-    async fn get_leaf_page(&self, pid: PageId) -> HummockResult<Arc<LeafPage>> {
-        let page = self.page_store.get_data_page(pid).await?;
-        let page = Arc::new(page);
-        self.page_mapping.insert_page(pid, page.clone());
-        Ok(page)
-    }
-
-    pub(crate) async fn get_leaf_page_delta(
-        &self,
-        pid: PageId,
-    ) -> HummockResult<Arc<RwLock<DeltaChain>>> {
-        match self.page_mapping.get_data_chains(&pid) {
-            Some(delta) => Ok(delta),
-            None => {
-                let page = match self.page_mapping.get_leaf_page(pid) {
-                    Some(page) => page.value().clone(),
-                    None => self.get_leaf_page(pid).await?,
-                };
-                let delta = DeltaChain::new(page);
-                Ok(self.page_mapping.insert_delta(pid, delta))
-            }
-        }
+    pub(crate) async fn get_leaf_page_delta(&self, pid: PageId) -> HummockResult<Arc<LeafPage>> {
+        self.page_mapping.get_or_fetch_page(pid).await
     }
 
     pub fn ingest_batch(
@@ -278,11 +242,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_root_smo() {
+        let store = PageStore::for_test();
         let mut engine = BwTreeEngine::open_engine(
             HashMap::default(),
-            Arc::new(MappingTable::new(1, 1024)),
+            Arc::new(MappingTable::new(1, 1024, store.clone())),
             Arc::new(LocalPageIdGenerator::default()),
-            PageStore::for_test(),
+            store,
             EngineOptions {
                 leaf_split_size: 150,
                 leaf_reconcile_size: 50,

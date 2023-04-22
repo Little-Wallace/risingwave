@@ -1,7 +1,6 @@
+mod base_page;
 mod bw_tree_engine;
 mod data_iterator;
-mod delta_chain;
-mod delta_hash_table;
 mod gc_page_collector;
 mod index_page;
 mod leaf_page;
