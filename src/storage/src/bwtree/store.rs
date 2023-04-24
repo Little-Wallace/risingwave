@@ -4,11 +4,13 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use futures::future::try_join_all;
+use futures::{Stream, StreamExt, TryStreamExt};
+use futures_async_stream::try_stream;
 use itertools::Itertools;
 use risingwave_common::catalog::TableId;
 use risingwave_common::util::epoch::INVALID_EPOCH;
 use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
-use risingwave_hummock_sdk::key::TableKey;
+use risingwave_hummock_sdk::key::{FullKey, TableKey};
 use risingwave_hummock_sdk::table_stats::TableStatsMap;
 use risingwave_hummock_sdk::{HummockReadEpoch, LocalSstableInfo};
 use risingwave_pb::hummock::SstableInfo;
@@ -16,11 +18,12 @@ use tokio::task::JoinHandle;
 use tracing::warn;
 
 use crate::bwtree::bw_tree_engine::BwTreeEngine;
+use crate::bwtree::bwtree_iterator::BwTreeIterator;
 use crate::bwtree::index_page::PageType;
 use crate::bwtree::page_id_generator::PageIdGenerator;
 use crate::bwtree::page_store::PageStoreRef;
 use crate::bwtree::PageId;
-use crate::error::StorageResult;
+use crate::error::{StorageError, StorageResult};
 use crate::hummock::{CompressionAlgorithm, HummockError, HummockResult};
 use crate::mem_table::{merge_stream, KeyOp, MemTable};
 use crate::storage_value::StorageValue;
@@ -34,7 +37,7 @@ use crate::StateStore;
 
 pub struct LocalBwTreeStore {
     table_id: TableId,
-    page: Arc<BwTreeEngine>,
+    engine: Arc<BwTreeEngine>,
     mem_table: MemTable,
     epoch: Option<u64>,
 }
@@ -115,10 +118,35 @@ impl BwTreeEngineCore {
         })
     }
 }
+pub struct BwTreeStoreIterator {
+    inner: BwTreeIterator,
+}
+#[try_stream(ok = StateStoreIterItem, error = StorageError)]
+async fn into_stream(mut iter: BwTreeStoreIterator, table_id: TableId) {
+    while let Some(chunk) = iter.next_chunk().await? {
+        for (k, v) in chunk {
+            yield (FullKey::new(table_id, TableKey(k), 0), v);
+        }
+    }
+}
+impl BwTreeStoreIterator {
+    pub fn new(inner: BwTreeIterator) -> Self {
+        Self { inner }
+    }
 
-pub struct BwTreeIterator {}
+    pub async fn next_chunk(&mut self) -> StorageResult<Option<Vec<(Bytes, Bytes)>>> {
+        if self.inner.is_valid() {
+            let chunk = self.inner.next_chunk().await?;
+            Ok(Some(chunk))
+        } else {
+            Ok(None)
+        }
+    }
+}
 
-impl StateStoreIter for BwTreeIterator {
+pub struct SeverlBwTreeIterator {}
+
+impl StateStoreIter for SeverlBwTreeIterator {
     type Item = StateStoreIterItem;
 
     type NextFuture<'a> = impl StateStoreIterNextFutureTrait<'a>;
@@ -130,27 +158,20 @@ impl StateStoreIter for BwTreeIterator {
 
 impl LocalBwTreeStore {
     pub async fn get_inner(&self, key: Bytes, epoch: u64) -> StorageResult<Option<Bytes>> {
-        let ret = self.page.get(TableKey(key), epoch).await?;
+        let ret = self.engine.get(TableKey(key), epoch).await?;
         Ok(ret)
-    }
-
-    pub async fn ingest_batch_inner(
-        &self,
-        kv_pairs: Vec<(Bytes, StorageValue)>,
-        write_options: WriteOptions,
-    ) -> StorageResult<usize> {
-        let sz = self.page.ingest_batch(kv_pairs, write_options);
-        Ok(sz)
     }
 
     pub async fn iter_inner(
         &self,
-        _key_range: IterKeyRange,
-        _epoch: u64,
-        _read_options: ReadOptions,
-    ) -> StorageResult<StreamTypeOfIter<BwTreeIterator>> {
-        let iter = BwTreeIterator {};
-        Ok(iter.into_stream())
+        key_range: IterKeyRange,
+        epoch: u64,
+        read_options: ReadOptions,
+    ) -> StorageResult<impl StateStoreIterItemStream> {
+        let table_id = read_options.table_id;
+        let inner = self.engine.iter(key_range, epoch, read_options).await?;
+        let iter = BwTreeStoreIterator::new(inner);
+        Ok(into_stream(iter, table_id))
     }
 
     pub async fn may_exist_inner(
@@ -176,6 +197,8 @@ impl LocalStateStore for LocalBwTreeStore {
 
     fn iter(&self, key_range: IterKeyRange, read_options: ReadOptions) -> Self::IterFuture<'_> {
         async move {
+            let table_id = read_options.table_id;
+            assert_eq!(table_id, self.table_id);
             let stream = self
                 .iter_inner(key_range.clone(), self.epoch(), read_options)
                 .await?;
@@ -220,14 +243,13 @@ impl LocalStateStore for LocalBwTreeStore {
                     }
                 }
             }
-            self.ingest_batch_inner(
+            Ok(self.engine.ingest_batch(
                 kv_pairs,
                 WriteOptions {
                     epoch: self.epoch(),
                     table_id: self.table_id,
                 },
-            )
-            .await
+            ))
         }
     }
 
@@ -277,9 +299,8 @@ impl BwTreeStorage {
         _key_range: IterKeyRange,
         _epoch: u64,
         _read_options: ReadOptions,
-    ) -> StorageResult<StreamTypeOfIter<BwTreeIterator>> {
-        let iter = BwTreeIterator {};
-        Ok(iter.into_stream())
+    ) -> StorageResult<StreamTypeOfIter<SeverlBwTreeIterator>> {
+        unimplemented!("todo support iter inner")
     }
 
     async fn get_inner(
@@ -306,7 +327,7 @@ impl BwTreeStorage {
 }
 
 impl StateStoreRead for BwTreeStorage {
-    type IterStream = StreamTypeOfIter<BwTreeIterator>;
+    type IterStream = StreamTypeOfIter<SeverlBwTreeIterator>;
 
     define_state_store_read_associated_type!();
 

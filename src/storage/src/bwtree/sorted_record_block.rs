@@ -22,7 +22,7 @@ use crate::hummock::sstable::utils::xxhash64_verify;
 use crate::hummock::value::HummockValue;
 use crate::hummock::{CompressionAlgorithm, HummockResult};
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SortedRecordBlock {
     /// Uncompressed entries data, with restart encoded restart points info.
     data: Bytes,

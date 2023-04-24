@@ -11,6 +11,7 @@ use crate::storage_value::StorageValue;
 
 const RIGHT_SPLIT_SIZE: usize = 32 * 1024;
 
+#[derive(PartialEq, Eq, Clone)]
 pub struct BasePage {
     raw: SortedRecordBlock,
     id: PageId,

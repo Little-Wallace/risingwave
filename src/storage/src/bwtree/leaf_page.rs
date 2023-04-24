@@ -120,6 +120,19 @@ impl LeafPage {
         self.update_size() + self.base_page.page_size()
     }
 
+    pub fn iter(&self, epoch: u64) -> MergedDataIterator<'_> {
+        let mut iters = Vec::with_capacity(self.deltas.len() + 1);
+        for delta in &self.deltas {
+            if delta.max_epoch() <= epoch {
+                iters.push(delta.raw.iter());
+            }
+        }
+        if !self.base_page.is_empty() {
+            iters.push(self.base_page.iter());
+        }
+        MergedDataIterator::new(iters)
+    }
+
     fn add_data_to_builder(&self, max_epoch: u64, safe_epoch: u64, builder: &mut BlockBuilder) {
         let mut iters = Vec::with_capacity(self.deltas.len() + 1);
         for delta in &self.deltas {
@@ -267,7 +280,7 @@ impl LeafPage {
 mod tests {
     use std::sync::Arc;
 
-    use bytes::{Bytes, BytesMut};
+    use bytes::{BufMut, Bytes, BytesMut};
     use risingwave_hummock_sdk::key::{user_key, StateTableKey, TableKey};
 
     use crate::bwtree::base_page::BasePage;
@@ -275,8 +288,8 @@ mod tests {
     use crate::bwtree::sorted_data_builder::BlockBuilder;
     use crate::bwtree::sorted_record_block::SortedRecordBlock;
     use crate::bwtree::test_utils::{from_slice_key, generate_data};
-    use crate::bwtree::INVALID_PAGE_ID;
     use crate::hummock::value::HummockValue;
+    use crate::hummock::CompressionAlgorithm;
     use crate::storage_value::StorageValue;
 
     fn build_sorted_block(data: Vec<(Bytes, StorageValue)>, epoch: u64) -> Bytes {
@@ -295,6 +308,16 @@ mod tests {
         builder.build()
     }
 
+    fn test_page_decode_and_encode(page: &BasePage) {
+        let mut buf = BytesMut::new();
+        page.encode_meta(&mut buf);
+        let data = page.compress(CompressionAlgorithm::None);
+        buf.put_u32_le(data.len() as u32);
+        buf.put_slice(data.as_ref());
+        let new_page = BasePage::decode(buf.freeze()).unwrap();
+        assert!(new_page.eq(page));
+    }
+
     #[test]
     fn test_leaf_apply() {
         let data = vec![
@@ -310,6 +333,8 @@ mod tests {
             SortedRecordBlock::decode(build_sorted_block(data, 1)).unwrap(),
             1,
         );
+        test_page_decode_and_encode(&base_leaf);
+
         let mut delta_chains = LeafPage::new(Arc::new(base_leaf));
         assert_eq!(
             delta_chains

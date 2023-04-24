@@ -1,7 +1,8 @@
 use std::collections::binary_heap::PeekMut;
 use std::collections::BinaryHeap;
 
-use risingwave_hummock_sdk::key::StateTableKey;
+use bytes::Bytes;
+use risingwave_hummock_sdk::key::{FullKey, StateTableKey};
 
 use crate::bwtree::sorted_record_block::BlockIterator;
 use crate::hummock::iterator::{Forward, HummockIterator};
@@ -27,6 +28,18 @@ impl<'a> MergedDataIterator<'a> {
         }
         for mut iter in self.iters.drain(..) {
             iter.seek_to_first();
+            if iter.is_valid() {
+                self.heap.push(iter);
+            }
+        }
+    }
+
+    pub fn seek(&mut self, key: &[u8]) {
+        for iter in self.heap.drain() {
+            self.iters.push(iter);
+        }
+        for mut iter in self.iters.drain(..) {
+            iter.seek(key);
             if iter.is_valid() {
                 self.heap.push(iter);
             }
@@ -97,6 +110,18 @@ impl MergedSharedBufferIterator {
         }
     }
 
+    pub fn seek<'a>(&'a mut self, full_key: FullKey<&'a [u8]>) {
+        for node in self.heap.drain() {
+            self.iters.push(node.iter);
+        }
+        for mut iter in self.iters.drain(..) {
+            iter.sync_seek(full_key);
+            if iter.is_valid() {
+                self.heap.push(Node { iter });
+            }
+        }
+    }
+
     pub fn seek_to_first(&mut self) {
         for node in self.heap.drain() {
             self.iters.push(node.iter);
@@ -110,10 +135,12 @@ impl MergedSharedBufferIterator {
     }
 
     pub fn is_valid(&self) -> bool {
-        self.heap
-            .peek()
-            .map(|iter| iter.iter.is_valid())
-            .unwrap_or(false)
+        self.heap.is_empty()
+            || self
+                .heap
+                .peek()
+                .map(|iter| iter.iter.is_valid())
+                .unwrap_or(false)
     }
 
     pub fn next(&mut self) {
@@ -126,6 +153,10 @@ impl MergedSharedBufferIterator {
 
     pub fn key(&self) -> StateTableKey<&[u8]> {
         self.heap.peek().unwrap().iter.table_key()
+    }
+
+    pub fn current_item(&self) -> (Bytes, HummockValue<Bytes>) {
+        self.heap.peek().unwrap().iter.current_item().clone()
     }
 
     pub fn value(&self) -> HummockValue<&[u8]> {

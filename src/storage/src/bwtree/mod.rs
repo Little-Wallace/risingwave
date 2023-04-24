@@ -1,5 +1,6 @@
 mod base_page;
 mod bw_tree_engine;
+mod bwtree_iterator;
 mod data_iterator;
 mod gc_page_collector;
 mod index_page;

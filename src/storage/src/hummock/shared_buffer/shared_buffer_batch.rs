@@ -405,7 +405,7 @@ impl<D: HummockIteratorDirection> SharedBufferBatchIterator<D> {
         }
     }
 
-    fn current_item(&self) -> &SharedBufferItem {
+    pub fn current_item(&self) -> &SharedBufferItem {
         assert!(self.is_valid());
         let idx = match D::direction() {
             DirectionEnum::Forward => self.current_idx,

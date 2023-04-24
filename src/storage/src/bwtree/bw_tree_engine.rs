@@ -1,13 +1,16 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use bytes::{Bytes, BytesMut};
 use itertools::Itertools;
 use parking_lot::RwLock;
-use risingwave_hummock_sdk::key::{get_vnode_id, StateTableKey, TableKey};
+use risingwave_common::hash::VirtualNode;
+use risingwave_hummock_sdk::key::{get_vnode_id, FullKey, StateTableKey, TableKey};
 use spin::Mutex;
 
+use crate::bwtree::bwtree_iterator::BwTreeIterator;
 use crate::bwtree::data_iterator::MergedSharedBufferIterator;
 use crate::bwtree::gc_page_collector::GcPageCollector;
 use crate::bwtree::index_page::PageType;
@@ -20,7 +23,7 @@ use crate::hummock::shared_buffer::shared_buffer_batch::SharedBufferBatch;
 use crate::hummock::value::HummockValue;
 use crate::hummock::HummockResult;
 use crate::storage_value::StorageValue;
-use crate::store::WriteOptions;
+use crate::store::{IterKeyRange, ReadOptions, WriteOptions};
 
 pub struct DirtyPageUpdates {
     pub pages: Vec<(usize, PageId)>,
@@ -95,7 +98,7 @@ impl SharedBuffer {
 }
 
 pub struct BwTreeEngine {
-    pub(crate) vnodes_map: ArcSwap<HashMap<usize, (PageId, PageType)>>,
+    pub(crate) vnodes_map: ArcSwap<BTreeMap<usize, (PageId, PageType)>>,
     pub(crate) page_mapping: Arc<MappingTable>,
     pub(crate) page_id_manager: Arc<dyn PageIdGenerator>,
     pub(crate) page_store: PageStoreRef,
@@ -107,7 +110,7 @@ pub struct BwTreeEngine {
 
 impl BwTreeEngine {
     pub fn open_engine(
-        vnodes: HashMap<usize, (PageId, PageType)>,
+        vnodes: BTreeMap<usize, (PageId, PageType)>,
         page_mapping: Arc<MappingTable>,
         page_id_manager: Arc<dyn PageIdGenerator>,
         page_store: PageStoreRef,
@@ -157,8 +160,77 @@ impl BwTreeEngine {
         }
     }
 
+    pub async fn iter(
+        &self,
+        key_range: IterKeyRange,
+        epoch: u64,
+        read_options: ReadOptions,
+    ) -> HummockResult<BwTreeIterator> {
+        let (mut mem_iter, flushed_epoch) = {
+            let guard = self.shared_buffer.read();
+            (guard.iter(epoch), guard.flushed_epoch)
+        };
+        let vnodes_map = self.vnodes_map.load_full();
+        let (start_vnode_id, first_key) = match &key_range.0 {
+            Bound::Unbounded => {
+                mem_iter.seek_to_first();
+                (0, Bytes::new())
+            }
+            Bound::Included(key) => {
+                mem_iter.seek(FullKey::new(
+                    read_options.table_id,
+                    TableKey(key.as_ref()),
+                    epoch,
+                ));
+                (get_vnode_id(&key), key.clone())
+            }
+            Bound::Excluded(_) => {
+                unimplemented!("TODO: support reverse seek");
+            }
+        };
+        let end_vnode_id = match &key_range.1 {
+            Bound::Unbounded => VirtualNode::MAX.to_index(),
+            Bound::Included(key) => get_vnode_id(&key),
+            Bound::Excluded(key) => get_vnode_id(&key),
+        };
+        if start_vnode_id != end_vnode_id {
+            unimplemented!("TODO: support scan root pages for several vnodes")
+        }
+        let first_page = self
+            .get_leaf_page(start_vnode_id, vnodes_map.as_ref(), &TableKey(first_key))
+            .await?;
+        let engine_iter = BwTreeIterator::new(
+            key_range,
+            mem_iter,
+            first_page,
+            self.page_mapping.clone(),
+            epoch,
+            flushed_epoch,
+        );
+        Ok(engine_iter)
+    }
+
     pub async fn get_new_page_id(&self) -> HummockResult<PageId> {
         self.page_id_manager.get_new_page_id().await
+    }
+
+    async fn get_leaf_page(
+        &self,
+        vnode_id: usize,
+        vnode_map: &BTreeMap<usize, (PageId, PageType)>,
+        target_key: &TableKey<Bytes>,
+    ) -> HummockResult<Option<Arc<LeafPage>>> {
+        let mut page_info = match vnode_map.get(&vnode_id).cloned() {
+            None => return Ok(None),
+            Some(pinfo) => pinfo,
+        };
+        while page_info.1 != PageType::Leaf {
+            // TODO: fetch from remote storage when page_mapping does not exist this page.
+            let index_page = self.page_mapping.get_index_page(&page_info.0);
+            page_info = index_page.read().get_page_in_range(&target_key);
+        }
+        let page = self.get_or_fetch_leaf_page(page_info.0).await?;
+        Ok(Some(page))
     }
 
     async fn search_index_page(
@@ -199,7 +271,7 @@ impl BwTreeEngine {
         }
     }
 
-    pub(crate) async fn get_leaf_page_delta(&self, pid: PageId) -> HummockResult<Arc<LeafPage>> {
+    pub(crate) async fn get_or_fetch_leaf_page(&self, pid: PageId) -> HummockResult<Arc<LeafPage>> {
         self.page_mapping.get_or_fetch_page(pid).await
     }
 
@@ -226,7 +298,7 @@ impl BwTreeEngine {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Arc;
 
     use bytes::BytesMut;
@@ -244,7 +316,7 @@ mod tests {
     async fn test_root_smo() {
         let store = PageStore::for_test();
         let mut engine = BwTreeEngine::open_engine(
-            HashMap::default(),
+            BTreeMap::default(),
             Arc::new(MappingTable::new(1, 1024, store.clone())),
             Arc::new(LocalPageIdGenerator::default()),
             store,

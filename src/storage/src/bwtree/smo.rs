@@ -92,7 +92,7 @@ impl BwTreeEngine {
         iter: &mut MergedSharedBufferIterator,
         checkpoint: &mut CheckpointData,
     ) -> HummockResult<IndexPageRedoLogRecord> {
-        let dirty_page = self.get_leaf_page_delta(current_page).await?;
+        let dirty_page = self.get_or_fetch_leaf_page(current_page).await?;
         let (largest_key, last_epoch) = (
             dirty_page.get_base_page().largest_user_key.clone(),
             dirty_page.last_epoch(),
@@ -565,7 +565,7 @@ impl BwTreeEngine {
             // from right to left
             sub_pages.reverse();
             for pid in &sub_pages {
-                let page = self.get_leaf_page_delta(*pid).await?;
+                let page = self.get_or_fetch_leaf_page(*pid).await?;
                 let sz = page.page_size();
                 if sz + current_size < self.options.index_min_merge_count {
                     current_size += sz;
