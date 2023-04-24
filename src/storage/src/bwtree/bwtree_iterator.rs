@@ -5,15 +5,18 @@ use bytes::{Buf, Bytes, BytesMut};
 use risingwave_hummock_sdk::key::{split_key_epoch, user_key, StateTableKey, TableKey};
 
 use crate::bwtree::data_iterator::MergedSharedBufferIterator;
+use crate::bwtree::index_page::PageType;
 use crate::bwtree::leaf_page::LeafPage;
 use crate::bwtree::mapping_table::MappingTable;
-use crate::bwtree::INVALID_PAGE_ID;
+use crate::bwtree::{PageId, INVALID_PAGE_ID};
 use crate::hummock::HummockResult;
 use crate::store::IterKeyRange;
 
 pub struct BwTreeIterator {
     mem_iter: MergedSharedBufferIterator,
     page_mapping: Arc<MappingTable>,
+    current_tree_idx: usize,
+    bwtree_root_page_ids: Vec<(PageId, PageType)>,
     current_page: Option<Arc<LeafPage>>,
     key_range: IterKeyRange,
     valid: bool,
@@ -25,17 +28,19 @@ impl BwTreeIterator {
     pub fn new(
         key_range: IterKeyRange,
         mem_iter: MergedSharedBufferIterator,
-        current_page: Option<Arc<LeafPage>>,
         page_mapping: Arc<MappingTable>,
+        bwtree_root_page_ids: Vec<(PageId, PageType)>,
         read_epoch: u64,
         flushed_epoch: u64,
     ) -> Self {
         Self {
             mem_iter,
-            current_page,
             page_mapping,
             key_range,
-            valid: false,
+            bwtree_root_page_ids,
+            current_page: None,
+            current_tree_idx: 0,
+            valid: true,
             read_epoch,
             flushed_epoch,
         }

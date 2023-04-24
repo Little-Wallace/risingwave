@@ -13,18 +13,20 @@ use crate::bwtree::PageId;
 use crate::hummock::{CompressionAlgorithm, HummockResult};
 
 #[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
-pub struct PageOffset {
-    pid: PageId,
-    epoch: u64,
-    offset: usize,
-    len: usize,
+pub struct PageInfo {
+    pub pid: PageId,
+    pub epoch: u64,
+    pub is_page: bool,
+    pub offset: usize,
+    pub len: usize,
 }
 
-impl PageOffset {
-    pub fn new(pid: PageId, epoch: u64, offset: usize, len: usize) -> Self {
+impl PageInfo {
+    pub fn new(pid: PageId, epoch: u64, is_page: bool, offset: usize, len: usize) -> Self {
         Self {
             pid,
             epoch,
+            is_page,
             offset,
             len,
         }
@@ -33,20 +35,22 @@ impl PageOffset {
     pub fn decode_from(buf: &mut &[u8]) -> Self {
         let pid = buf.get_u64_le();
         let epoch = buf.get_u64_le();
+        let is_page = buf.get_u8() == 1;
         let offset = buf.get_u32_le() as usize;
         let len = buf.get_u32_le() as usize;
-        Self::new(pid, epoch, offset, len)
+        Self::new(pid, epoch, is_page, offset, len)
     }
 
     pub fn encode_into(&self, buf: &mut impl BufMut) {
         buf.put_u64_le(self.pid);
         buf.put_u64_le(self.epoch);
+        buf.put_u8(if self.is_page { 1 } else { 0 });
         buf.put_u32_le(self.offset as u32);
         buf.put_u32_le(self.len as u32);
     }
 }
 
-impl PartialOrd for PageOffset {
+impl PartialOrd for PageInfo {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(
             self.pid
@@ -56,7 +60,7 @@ impl PartialOrd for PageOffset {
     }
 }
 
-impl Ord for PageOffset {
+impl Ord for PageInfo {
     fn cmp(&self, other: &Self) -> Ordering {
         self.partial_cmp(other).unwrap()
     }
@@ -65,25 +69,29 @@ impl Ord for PageOffset {
 pub struct SegmentMeta {
     pub algorithm: CompressionAlgorithm,
     pub redo_log_offset: usize,
-    pub page_offset: Vec<PageOffset>,
-    pub delta_offset: Vec<PageOffset>,
-    pub index_page_offset: Vec<PageOffset>,
+    pub page_offset: Vec<PageInfo>,
+    pub index_page_offset: Vec<PageInfo>,
 }
 
 impl SegmentMeta {
     pub fn get_page_offset(&self, pid: PageId) -> Option<(usize, usize)> {
-        let pos = self.page_offset.partition_point(|item| item.pid < pid);
-        if pos < self.page_offset.len() && self.page_offset[pos].pid == pid {
-            return Some((self.page_offset[pos].offset, self.page_offset[pos].len));
+        let mut pos = self.page_offset.partition_point(|item| item.pid < pid);
+        while pos < self.page_offset.len() && self.page_offset[pos].pid == pid {
+            if self.page_offset[pos].is_page {
+                return Some((self.page_offset[pos].offset, self.page_offset[pos].len));
+            }
+            pos += 1;
         }
         None
     }
 
     pub fn get_delta_offset(&self, pid: PageId) -> Vec<(usize, usize)> {
         let mut ret = vec![];
-        let mut pos = self.delta_offset.partition_point(|item| item.pid < pid);
-        while pos < self.delta_offset.len() && self.delta_offset[pos].pid == pid {
-            ret.push((self.delta_offset[pos].offset, self.delta_offset[pos].len));
+        let mut pos = self.page_offset.partition_point(|item| item.pid < pid);
+        while pos < self.page_offset.len() && self.page_offset[pos].pid == pid {
+            if !self.page_offset[pos].is_page {
+                ret.push((self.page_offset[pos].offset, self.page_offset[pos].len));
+            }
             pos += 1;
         }
         ret
@@ -95,23 +103,17 @@ impl SegmentMeta {
         let page_offset_len = buf.get_u32_le() as usize;
         let mut page_offset = Vec::with_capacity(page_offset_len);
         for _ in 0..page_offset_len {
-            page_offset.push(PageOffset::decode_from(buf));
-        }
-        let delta_offset_len = buf.get_u32_le() as usize;
-        let mut delta_offset = Vec::with_capacity(delta_offset_len);
-        for _ in 0..delta_offset_len {
-            delta_offset.push(PageOffset::decode_from(buf));
+            page_offset.push(PageInfo::decode_from(buf));
         }
         let index_page_offset_len = buf.get_u32_le() as usize;
         let mut index_page_offset = Vec::with_capacity(index_page_offset_len);
         for _ in 0..index_page_offset_len {
-            index_page_offset.push(PageOffset::decode_from(buf));
+            index_page_offset.push(PageInfo::decode_from(buf));
         }
         Ok(Self {
             algorithm,
             redo_log_offset,
             page_offset,
-            delta_offset,
             index_page_offset,
         })
     }
@@ -121,10 +123,6 @@ impl SegmentMeta {
         buf.put_u32_le(self.redo_log_offset as u32);
         buf.put_u32_le(self.page_offset.len() as u32);
         for offset in &self.page_offset {
-            offset.encode_into(buf);
-        }
-        buf.put_u32_le(self.delta_offset.len() as u32);
-        for offset in &self.delta_offset {
             offset.encode_into(buf);
         }
         buf.put_u32_le(self.index_page_offset.len() as u32);
@@ -138,9 +136,8 @@ pub struct SegmentBuilder {
     id: HummockSstableObjectId,
     algorithm: CompressionAlgorithm,
     writer: MonitoredStreamingUploader,
-    page_offset: Vec<PageOffset>,
-    delta_offset: Vec<PageOffset>,
-    index_page_offset: Vec<PageOffset>,
+    data_offset: Vec<PageInfo>,
+    index_page_offset: Vec<PageInfo>,
     redo_log_offset: usize,
     data_len: usize,
     max_epoch: u64,
@@ -157,8 +154,7 @@ impl SegmentBuilder {
             id,
             algorithm,
             writer,
-            page_offset: vec![],
-            delta_offset: vec![],
+            data_offset: vec![],
             index_page_offset: vec![],
             redo_log_offset: 0,
             data_len: 0,
@@ -174,9 +170,10 @@ impl SegmentBuilder {
         let mut buf = BytesMut::with_capacity(page.encode_size() + std::mem::size_of::<u32>());
         page.encode_meta(&mut buf);
         buf.put_u32_le(data.len() as u32);
-        self.page_offset.push(PageOffset::new(
+        self.data_offset.push(PageInfo::new(
             page.get_page_id(),
             page.epoch(),
+            true,
             self.data_len,
             buf.len() + data.len(),
         ));
@@ -195,11 +192,12 @@ impl SegmentBuilder {
         buf.put_u64_le(paeg_id);
         buf.put_u64_le(delta.max_epoch());
         buf.put_u64_le(delta.prev_epoch());
-        self.delta_offset.push(PageOffset::new(
+        self.data_offset.push(PageInfo::new(
             paeg_id,
             delta.max_epoch(),
-            self.data_len,
+            false,
             buf.len() + data.len(),
+            self.data_len,
         ));
         self.data_len += buf.len();
         self.writer.write_bytes(buf.freeze()).await?;
@@ -215,8 +213,13 @@ impl SegmentBuilder {
         data: Bytes,
     ) -> HummockResult<()> {
         self.max_epoch = std::cmp::max(self.max_epoch, epoch);
-        self.index_page_offset
-            .push(PageOffset::new(page_id, epoch, self.data_len, data.len()));
+        self.index_page_offset.push(PageInfo::new(
+            page_id,
+            epoch,
+            true,
+            self.data_len,
+            data.len(),
+        ));
         self.data_len += data.len();
         self.writer.write_bytes(data).await?;
         Ok(())
@@ -245,13 +248,11 @@ impl SegmentBuilder {
 
     pub async fn finish(mut self) -> HummockResult<SstableInfo> {
         let meta_offset = self.data_len as u64;
-        self.page_offset.sort();
+        self.data_offset.sort();
         self.index_page_offset.sort();
-        self.delta_offset.sort();
         let meta = SegmentMeta {
             algorithm: self.algorithm,
-            page_offset: self.page_offset,
-            delta_offset: self.delta_offset,
+            page_offset: self.data_offset,
             index_page_offset: self.index_page_offset,
             redo_log_offset: self.redo_log_offset,
         };
@@ -275,3 +276,5 @@ impl SegmentBuilder {
         })
     }
 }
+
+pub struct SegmentIterator {}

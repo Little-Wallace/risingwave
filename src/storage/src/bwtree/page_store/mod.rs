@@ -1,7 +1,10 @@
+mod compact;
 mod segment_file;
 
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use await_tree::InstrumentAwait;
 use risingwave_common::cache::{CacheableEntry, LruCache};
 use risingwave_hummock_sdk::{HummockSstableObjectId, LocalSstableInfo};
@@ -12,8 +15,10 @@ use risingwave_object_store::object::{
 };
 use risingwave_pb::bwtree::PageStoreVersion;
 use risingwave_pb::hummock::SstableInfo;
+use spin::RwLock;
 
 use crate::bwtree::base_page::BasePage;
+use crate::bwtree::index_page::PageType;
 use crate::bwtree::leaf_page::{Delta, LeafPage};
 use crate::bwtree::page_store::segment_file::{SegmentBuilder, SegmentMeta};
 use crate::bwtree::smo::CheckpointData;
@@ -23,11 +28,18 @@ use crate::hummock::{CompressionAlgorithm, HummockError, HummockResult};
 pub type PageStoreRef = Arc<PageStore>;
 pub type SegmentHolder = CacheableEntry<HummockSstableObjectId, Box<SegmentMeta>>;
 
+const PAGE_INDEX_COUNT: u64 = 256;
+pub type PageIndexes = Arc<RwLock<HashMap<PageId, (u64, bool)>>>;
+
 pub struct PageStore {
     object_store: ObjectStoreRef,
     path: String,
     meta_cache: Arc<LruCache<HummockSstableObjectId, Box<SegmentMeta>>>,
-    page_store_version: PageStoreVersion,
+    page_mapping: Arc<LruCache<u64, PageIndexes>>,
+    page_store_version: ArcSwap<PageStoreVersion>,
+    // TODO: for page deleted by page-merge-operation, we only record it in smo records. we need a
+    // way to make sure that this page could be removed from this segment. deletion_map:
+    // Arc<RwLock<HashSet<PageId>>>,
 }
 
 impl PageStore {
@@ -38,20 +50,38 @@ impl PageStore {
             )),
             path: "".to_string(),
             meta_cache: Arc::new(LruCache::new(0, 4096)),
-            page_store_version: PageStoreVersion {
+            page_store_version: ArcSwap::new(Arc::new(PageStoreVersion {
                 id: 0,
                 tables: Default::default(),
                 max_committed_epoch: 0,
                 safe_epoch: 0,
                 table_infos: vec![],
                 total_file_size: 0,
-            },
+            })),
+            page_mapping: Arc::new(LruCache::new(0, 4096)),
+        })
+    }
+
+    pub fn new(
+        page_mapping_capacity: usize,
+        segment_meta_capacity: usize,
+        path: String,
+        page_store_version: PageStoreVersion,
+        object_store: ObjectStoreRef,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            object_store,
+            path,
+            meta_cache: Arc::new(LruCache::new(2, segment_meta_capacity)),
+            page_store_version: ArcSwap::new(Arc::new(page_store_version)),
+            page_mapping: Arc::new(LruCache::new(1, page_mapping_capacity)),
         })
     }
 
     pub async fn get_data_page(&self, pid: PageId) -> HummockResult<LeafPage> {
         let mut deltas = vec![];
-        for segment_info in self.page_store_version.table_infos.iter().rev() {
+        let page_store_version = self.page_store_version.load_full();
+        for segment_info in page_store_version.table_infos.iter().rev() {
             let segment = self.get_segment_meta(segment_info).await?;
             let delta_pos = segment.value().get_delta_offset(pid);
             if !delta_pos.is_empty() {
@@ -142,5 +172,65 @@ impl PageStore {
         let path = self.get_segment_data_path(object_id);
         let uploader = self.open_uploader(&path).await?;
         Ok(SegmentBuilder::open(object_id, algothrim, uploader))
+    }
+
+    fn index_of_page(page: PageId) -> u64 {
+        page / PAGE_INDEX_COUNT
+    }
+
+    #[inline(always)]
+    fn check_page_expired(
+        index: &HashMap<PageId, (u64, bool)>,
+        page_id: PageId,
+        lsn: (u64, bool),
+    ) -> Option<bool> {
+        index.get(&page_id).map(|last_lsn| lsn.lt(last_lsn))
+    }
+
+    pub async fn is_leaf_page_expired(
+        &self,
+        page_id: PageId,
+        epoch: u64,
+        is_page: bool,
+    ) -> HummockResult<bool> {
+        let index_id = Self::index_of_page(page_id);
+        let index = self
+            .page_mapping
+            .lookup_with_request_dedup::<_, HummockError, _>(index_id, index_id, || async move {
+                let charge = (PAGE_INDEX_COUNT as usize) * std::mem::size_of::<u64>() * 2;
+                Ok((PageIndexes::new(RwLock::new(HashMap::default())), charge))
+            })
+            .verbose_instrument_await("is_page_expired")
+            .await?;
+        {
+            let guard = index.value().as_ref().read();
+            if let Some(ret) = Self::check_page_expired(&*guard, page_id, (epoch, is_page)) {
+                return Ok(ret);
+            }
+        }
+
+        let mut guard = index.value().as_ref().write();
+        if let Some(ret) = Self::check_page_expired(&*guard, page_id, (epoch, is_page)) {
+            return Ok(ret);
+        }
+        let page_store_version = self.page_store_version.load_full();
+        for segment_info in page_store_version.table_infos.iter().rev() {
+            let segment = self.get_segment_meta(segment_info).await?;
+            let pos = segment
+                .value()
+                .page_offset
+                .partition_point(|item| item.pid < page_id);
+            if pos < segment.value().page_offset.len()
+                && segment.value().page_offset[pos].pid == page_id
+            {
+                let item = &segment.value().page_offset[pos];
+                guard.insert(item.pid, (item.epoch, item.is_page));
+                return Ok((epoch, is_page).lt(&(item.epoch, item.is_page)));
+            }
+        }
+        Err(HummockError::other(format!(
+            "can not find page {}",
+            page_id
+        )))
     }
 }
