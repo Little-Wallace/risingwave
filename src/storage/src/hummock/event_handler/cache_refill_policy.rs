@@ -45,34 +45,37 @@ impl CacheRefillPolicy {
             let policy = self.clone();
             let handle = tokio::spawn(async move {
                 let timer = policy.metrics.refill_cache_duration.start_timer();
-                let mut preload_count = 0;
-                let stats = StoreLocalStatistic::default();
-                let mut flatten_reqs = Vec::new();
+                let mut ssts = vec![];
+                let mut not_in_cache = false;
                 for group_delta in delta.group_deltas.values() {
-                    let mut is_bottommost_level = false;
-                    let last_pos = flatten_reqs.len();
+                    if not_in_cache {
+                        break;
+                    }
                     for d in &group_delta.group_deltas {
                         if let Some(group_delta::DeltaType::IntraLevel(level_delta)) =
                             d.delta_type.as_ref()
                         {
-                            if level_delta.level_idx >= max_level {
-                                is_bottommost_level = true;
-                                break;
+                            if level_delta.level_idx != 0 {
+                                for sst_id in &level_delta.removed_table_ids {
+                                    if !policy.sstable_store.contains_sstable(sst_id) {
+                                        not_in_cache = true;
+                                        break;
+                                    }
+                                }
                             }
-                            for sst in &level_delta.inserted_table_infos {
-                                flatten_reqs
-                                    .push(policy.sstable_store.sstable_syncable(sst, &stats));
-                            }
-                            preload_count += level_delta.inserted_table_infos.len();
-                        }
-                    }
-                    if is_bottommost_level {
-                        while flatten_reqs.len() > last_pos {
-                            flatten_reqs.pop();
+                            ssts.extend(level_delta.inserted_table_infos.clone());
                         }
                     }
                 }
-                policy.metrics.preload_io_count.inc_by(preload_count as u64);
+                if not_in_cache {
+                    return;
+                }
+                let stats = StoreLocalStatistic::default();
+                let mut flatten_reqs = Vec::new();
+                for sst in &ssts {
+                    flatten_reqs.push(policy.sstable_store.sstable_syncable(sst, &stats));
+                }
+                policy.metrics.preload_io_count.inc_by(ssts.len() as u64);
                 let _ = try_join_all(flatten_reqs).await;
                 timer.observe_duration();
             });

@@ -340,6 +340,10 @@ impl SstableStore {
         self.meta_cache.clone()
     }
 
+    pub fn contains_sstable(&self, sst_id: &HummockSstableObjectId) ->bool {
+        self.meta_cache.contains(*sst_id, sst_id)
+    }
+
     pub fn get_block_cache(&self) -> BlockCache {
         self.block_cache.clone()
     }
