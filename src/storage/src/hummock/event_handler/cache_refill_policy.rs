@@ -19,7 +19,7 @@ use futures::future::try_join_all;
 use risingwave_pb::hummock::{group_delta, HummockVersionDelta};
 
 use crate::hummock::sstable_store::SstableStoreRef;
-use crate::monitor::{CompactorMetrics, StoreLocalStatistic};
+use crate::monitor::CompactorMetrics;
 
 pub struct CacheRefillPolicy {
     sstable_store: SstableStoreRef,
@@ -40,7 +40,7 @@ impl CacheRefillPolicy {
         }
     }
 
-    pub async fn execute(self: &Arc<Self>, delta: HummockVersionDelta, max_level: u32) {
+    pub async fn execute(self: &Arc<Self>, delta: HummockVersionDelta) {
         if self.max_preload_wait_time_mill > 0 {
             let policy = self.clone();
             let handle = tokio::spawn(async move {
@@ -70,10 +70,9 @@ impl CacheRefillPolicy {
                 if not_in_cache {
                     return;
                 }
-                let stats = StoreLocalStatistic::default();
                 let mut flatten_reqs = Vec::new();
                 for sst in &ssts {
-                    flatten_reqs.push(policy.sstable_store.sstable_syncable(sst, &stats));
+                    flatten_reqs.push(policy.sstable_store.preload(sst));
                 }
                 policy.metrics.preload_io_count.inc_by(ssts.len() as u64);
                 let _ = try_join_all(flatten_reqs).await;

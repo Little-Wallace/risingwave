@@ -765,13 +765,11 @@ impl HummockVersionReader {
         for (_, fetch_meta_req) in &fetch_meta_reqs {
             for sstable_info in fetch_meta_req {
                 let inner_req_count = req_count;
-                let capture_ref = async {
+                let capture_ref =
                     // We would fill block to high priority cache for level-0
                     self.sstable_store
-                        .sstable_syncable(sstable_info, &local_stats)
-                        .in_span(Span::enter_with_local_parent("get_sstable"))
-                        .await
-                };
+                        .sstable(sstable_info, &mut local_stats)
+                        .in_span(Span::enter_with_local_parent("get_sstable"));
                 // use `buffer_unordered` to simulate `try_join_all` by assigning an index
                 flatten_reqs
                     .push(async move { capture_ref.await.map(|result| (inner_req_count, result)) });
@@ -783,11 +781,9 @@ impl HummockVersionReader {
             .iter_fetch_meta_duration
             .with_label_values(&[table_id_label])
             .start_timer();
-        let mut local_cache_meta_block_unhit = 0;
         let mut flatten_resps = vec![None; req_count];
         for flatten_req in flatten_reqs {
             let (req_index, resp) = flatten_req.await?;
-            local_cache_meta_block_unhit += resp.2;
             flatten_resps[req_count - req_index - 1] = Some(resp);
         }
         let fetch_meta_duration_sec = timer.stop_and_record();
@@ -812,10 +808,8 @@ impl HummockVersionReader {
             if level_type == LevelType::Nonoverlapping as i32 {
                 let mut sstables = vec![];
                 for sstable_info in fetch_meta_req {
-                    let (sstable, local_cache_meta_block_miss, ..) =
-                        flatten_resps.pop().unwrap().unwrap();
+                    let sstable = flatten_resps.pop().unwrap().unwrap();
                     assert_eq!(sstable_info.get_object_id(), sstable.value().id);
-                    local_stats.apply_meta_fetch(local_cache_meta_block_miss);
                     if !sstable.value().meta.monotonic_tombstone_events.is_empty()
                         && !read_options.ignore_range_tombstone
                     {
@@ -838,10 +832,8 @@ impl HummockVersionReader {
             } else {
                 let mut iters = Vec::new();
                 for sstable_info in fetch_meta_req {
-                    let (sstable, local_cache_meta_block_miss, ..) =
-                        flatten_resps.pop().unwrap().unwrap();
+                    let sstable = flatten_resps.pop().unwrap().unwrap();
                     assert_eq!(sstable_info.get_object_id(), sstable.value().id);
-                    local_stats.apply_meta_fetch(local_cache_meta_block_miss);
                     if !sstable.value().meta.monotonic_tombstone_events.is_empty()
                         && !read_options.ignore_range_tombstone
                     {
