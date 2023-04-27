@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use std::clone::Clone;
+use std::future::Future;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
+use await_tree::InstrumentAwait;
 use bytes::{Buf, BufMut, Bytes};
 use fail::fail_point;
 use itertools::Itertools;
@@ -363,7 +365,7 @@ impl SstableStore {
         &self,
         sst: &SstableInfo,
         stats: &mut StoreLocalStatistic,
-    ) -> LookupResponse<HummockSstableObjectId, Box<Sstable>, HummockError> {
+    ) -> impl Future<Output = HummockResult<TableHolder>> + Send + 'static {
         let object_id = sst.get_object_id();
         let lookup_response = self
             .meta_cache
@@ -398,42 +400,10 @@ impl SstableStore {
         match &lookup_response {
             LookupResponse::Miss(_) | LookupResponse::WaitPendingRequest(_) => {
                 stats.cache_meta_block_miss += 1;
-            },
+            }
             _ => (),
         }
-        lookup_response
-    }
-
-    pub fn preload(
-        &self,
-        sst: &SstableInfo,
-    ) -> LookupResponse<HummockSstableObjectId, Box<Sstable>, HummockError> {
-        let object_id = sst.object_id;
-        self
-            .meta_cache
-            .lookup_with_request_dedup::<_, HummockError, _>(
-                object_id,
-                object_id,
-                CachePriority::Low,
-                || {
-                    let store = self.store.clone();
-                    let meta_path = self.get_sst_data_path(object_id);
-                    let loc = BlockLocation {
-                        offset: sst.meta_offset as usize,
-                        size: (sst.file_size - sst.meta_offset) as usize,
-                    };
-                    async move {
-                        let buf = store
-                            .read(&meta_path, Some(loc))
-                            .await
-                            .map_err(HummockError::object_io_error)?;
-                        let meta = SstableMeta::decode(&mut &buf[..])?;
-                        let sst = Sstable::new(object_id, meta);
-                        let charge = sst.estimate_size();
-                        Ok((Box::new(sst), charge))
-                    }
-                },
-            )
+        lookup_response.verbose_instrument_await("sstable")
     }
 
     pub async fn list_ssts_from_object_store(&self) -> HummockResult<Vec<ObjectMetadata>> {

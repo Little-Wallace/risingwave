@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures::future::try_join_all;
+use futures::future::{try_join_all, BoxFuture};
 use risingwave_pb::hummock::{group_delta, HummockVersionDelta};
 
-use crate::hummock::sstable_store::SstableStoreRef;
-use crate::monitor::CompactorMetrics;
+use crate::hummock::sstable_store::{SstableStoreRef, TableHolder};
+use crate::hummock::HummockResult;
+use crate::monitor::{CompactorMetrics, StoreLocalStatistic};
 
 pub struct CacheRefillPolicy {
     sstable_store: SstableStoreRef,
@@ -40,44 +42,40 @@ impl CacheRefillPolicy {
         }
     }
 
-    pub async fn execute(self: &Arc<Self>, delta: HummockVersionDelta) {
+    pub async fn execute(&self, delta: HummockVersionDelta) {
         if self.max_preload_wait_time_mill > 0 {
-            let policy = self.clone();
-            let handle = tokio::spawn(async move {
-                let timer = policy.metrics.refill_cache_duration.start_timer();
-                let mut ssts = vec![];
-                let mut not_in_cache = false;
-                for group_delta in delta.group_deltas.values() {
-                    if not_in_cache {
-                        break;
-                    }
-                    for d in &group_delta.group_deltas {
-                        if let Some(group_delta::DeltaType::IntraLevel(level_delta)) =
-                            d.delta_type.as_ref()
-                        {
-                            if level_delta.level_idx != 0 {
-                                for sst_id in &level_delta.removed_table_ids {
-                                    if !policy.sstable_store.contains_sstable(sst_id) {
-                                        not_in_cache = true;
-                                        break;
-                                    }
+            let mut ssts = vec![];
+            let mut not_in_cache = false;
+            for group_delta in delta.group_deltas.values() {
+                if not_in_cache {
+                    break;
+                }
+                for d in &group_delta.group_deltas {
+                    if let Some(group_delta::DeltaType::IntraLevel(level_delta)) =
+                        d.delta_type.as_ref()
+                    {
+                        if level_delta.level_idx != 0 {
+                            for sst_id in &level_delta.removed_table_ids {
+                                if !self.sstable_store.contains_sstable(sst_id) {
+                                    not_in_cache = true;
+                                    break;
                                 }
                             }
-                            ssts.extend(level_delta.inserted_table_infos.clone());
                         }
+                        ssts.extend(level_delta.inserted_table_infos.clone());
                     }
                 }
-                if not_in_cache {
-                    return;
-                }
-                let mut flatten_reqs = Vec::new();
-                for sst in &ssts {
-                    flatten_reqs.push(policy.sstable_store.preload(sst));
-                }
-                policy.metrics.preload_io_count.inc_by(ssts.len() as u64);
-                let _ = try_join_all(flatten_reqs).await;
-                timer.observe_duration();
-            });
+            }
+            if not_in_cache {
+                return;
+            }
+            self.metrics.preload_io_count.inc_by(ssts.len() as u64);
+            let mut stats = StoreLocalStatistic::default();
+            let mut flatten_reqs = vec![];
+            for sst in &ssts {
+                flatten_reqs.push(self.sstable_store.sstable(sst, &mut stats));
+            }
+            let handle = try_join_all(flatten_reqs);
             let _ = tokio::time::timeout(
                 Duration::from_millis(self.max_preload_wait_time_mill),
                 handle,
