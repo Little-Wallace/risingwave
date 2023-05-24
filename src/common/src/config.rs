@@ -603,11 +603,11 @@ mod default {
         }
 
         pub fn move_table_size_limit() -> u64 {
-            5 * 1024 * 1024 * 1024 // 5GB
+            4 * 1024 * 1024 * 1024 // 4GB
         }
 
         pub fn split_group_size_limit() -> u64 {
-            20 * 1024 * 1024 * 1024 // 20GB
+            16 * 1024 * 1024 * 1024 // 16GB
         }
     }
 
