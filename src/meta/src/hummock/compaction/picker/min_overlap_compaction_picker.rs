@@ -294,20 +294,6 @@ impl NonOverlapSubLevelPicker {
                     .map(|(_, files)| files.len())
                     .sum::<usize>();
 
-            if ret
-                .sstable_infos
-                .iter()
-                .filter(|files| !files.is_empty())
-                .count()
-                >= self.min_depth
-                && ret.total_file_size > self.min_compaction_bytes
-                && (ret.total_file_size + current_level_size + add_files_size
-                    > self.max_compaction_bytes
-                    || add_files_size > ret.total_file_size)
-            {
-                break;
-            }
-
             ret.total_file_count += add_files_count;
             ret.total_file_size += add_files_size + current_level_size;
             if !overlap_files_range.is_empty() {
