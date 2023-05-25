@@ -18,6 +18,7 @@ use itertools::Itertools;
 use risingwave_hummock_sdk::compaction_group::hummock_version_ext::HummockLevelsExt;
 use risingwave_pb::hummock::hummock_version::Levels;
 use risingwave_pb::hummock::{CompactionConfig, InputLevel, Level, LevelType, OverlappingLevel};
+use tracing::warn;
 
 use super::min_overlap_compaction_picker::NonOverlapSubLevelPicker;
 use super::{CompactionInput, CompactionPicker, LocalPickerStatistic};
@@ -113,6 +114,7 @@ impl LevelCompactionPicker {
 
         let mut skip_by_pending = false;
         let mut skip_by_write_amp = false;
+        let mut min_write_amp_meet = false;
         let mut input_levels = vec![];
         for input in l0_select_tables_vec {
             let l0_select_tables = input
@@ -151,6 +153,9 @@ impl LevelCompactionPicker {
                 continue;
             }
 
+            if input.total_file_size >= target_level_size {
+                min_write_amp_meet = true;
+            }
             input_levels.push((input, target_level_size, target_level_ssts));
         }
 
@@ -165,31 +170,8 @@ impl LevelCompactionPicker {
             return None;
         }
 
-        const MB_SIZE: u64 = 1024 * 1024;
-        let mut min_score = u64::MAX;
-        let mut min_target_file_size = u64::MAX;
-        let max_base_level_compact_size = target_level.total_file_size / 4;
-        for (input, target_level_size, _) in &input_levels {
-            if input.total_file_size == 0 {
-                continue;
-            }
-            let score = *target_level_size * MB_SIZE / input.total_file_size;
-            min_score = std::cmp::min(min_score, score);
-            if score <= MB_SIZE {
-                min_target_file_size = std::cmp::min(*target_level_size, min_target_file_size);
-            }
-        }
-        let min_write_amp_meet = min_score <= MB_SIZE;
-        let min_target_files_meet = min_target_file_size <= max_base_level_compact_size;
         for (input, target_file_size, target_level_files) in input_levels {
             if min_write_amp_meet && input.total_file_size < target_file_size {
-                continue;
-            }
-
-            if min_write_amp_meet
-                && min_target_files_meet
-                && target_file_size > max_base_level_compact_size
-            {
                 continue;
             }
 
@@ -214,6 +196,7 @@ impl LevelCompactionPicker {
                 target_sub_level_id: 0,
             });
         }
+        stats.skip_by_write_amp_limit += 1;
         None
     }
 
