@@ -191,44 +191,34 @@ impl DynamicLevelSelectorCore {
             .sum::<usize>()
             - handlers[0].get_pending_file_count();
 
+        // The read query at the overlapping level needs to merge all the ssts, so the number of
+        // ssts is the most important factor affecting the read performance, we use file count
+        // to calculate the score
+        let overlapping_file_count = levels
+            .l0
+            .as_ref()
+            .unwrap()
+            .sub_levels
+            .iter()
+            .filter(|level| level.level_type() == LevelType::Overlapping)
+            .map(|level| level.table_infos.len())
+            .sum::<usize>() as u64;
+
         let max_l0_overlapping_score = std::cmp::max(
             SCORE_BASE * 2,
-            levels
-                .l0
-                .as_ref()
-                .unwrap()
-                .sub_levels
-                .iter()
-                .filter(|sub_level| sub_level.level_type() == LevelType::Overlapping)
-                .count() as u64
-                * SCORE_BASE
-                / self.config.level0_overlapping_sub_level_compact_level_count as u64,
+            overlapping_file_count * SCORE_BASE
+                / self.config.level0_tier_compact_file_number as u64,
         );
 
         if idle_file_count > 0 {
             // trigger l0 compaction when the number of files is too large.
-
-            // The read query at the overlapping level needs to merge all the ssts, so the number of
-            // ssts is the most important factor affecting the read performance, we use file count
-            // to calculate the score
-            let overlapping_file_count = levels
-                .l0
-                .as_ref()
-                .unwrap()
-                .sub_levels
-                .iter()
-                .filter(|level| level.level_type() == LevelType::Overlapping)
-                .map(|level| level.table_infos.len())
-                .sum::<usize>();
-
             // FIXME: use overlapping idle file count
-            let l0_overlapping_score =
-                std::cmp::min(idle_file_count, overlapping_file_count) as u64 * SCORE_BASE
-                    / self.config.level0_tier_compact_file_number;
+            let idle_file_score =
+                (idle_file_count as u64) * SCORE_BASE / self.config.level0_tier_compact_file_number;
 
             // Reduce the level num of l0 overlapping sub_level
             ctx.score_levels.push((
-                std::cmp::min(l0_overlapping_score, max_l0_overlapping_score),
+                std::cmp::min(idle_file_score, max_l0_overlapping_score),
                 0,
                 0,
             ));
