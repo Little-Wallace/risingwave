@@ -18,7 +18,6 @@ use itertools::Itertools;
 use risingwave_hummock_sdk::compaction_group::hummock_version_ext::HummockLevelsExt;
 use risingwave_pb::hummock::hummock_version::Levels;
 use risingwave_pb::hummock::{CompactionConfig, InputLevel, Level, LevelType, OverlappingLevel};
-use tracing::warn;
 
 use super::min_overlap_compaction_picker::NonOverlapSubLevelPicker;
 use super::{CompactionInput, CompactionPicker, LocalPickerStatistic};
@@ -109,11 +108,11 @@ impl LevelCompactionPicker {
         let l0_select_tables_vec = non_overlap_sub_level_picker
             .pick_l0_multi_non_overlap_level(&l0.sub_levels, &level_handlers[0]);
         if l0_select_tables_vec.is_empty() {
+            stats.skip_by_pending_files += 1;
             return None;
         }
 
         let mut skip_by_pending = false;
-        let mut skip_by_write_amp = false;
         let mut min_write_amp_meet = false;
         let mut input_levels = vec![];
         for input in l0_select_tables_vec {
@@ -142,17 +141,6 @@ impl LevelCompactionPicker {
                 continue;
             }
 
-            if (!target_level_ssts.is_empty() || input.sstable_infos.len() > 1)
-                && input.sstable_infos.len()
-                    < self.config.level0_sub_level_compact_level_count as usize
-                && input.total_file_size < target_level_size
-                && input.total_file_count < self.config.level0_max_compact_file_number as usize
-            {
-                // not trivial move
-                skip_by_write_amp = true;
-                continue;
-            }
-
             if input.total_file_size >= target_level_size {
                 min_write_amp_meet = true;
             }
@@ -163,15 +151,17 @@ impl LevelCompactionPicker {
             if skip_by_pending {
                 stats.skip_by_pending_files += 1;
             }
-
-            if skip_by_write_amp {
-                stats.skip_by_write_amp_limit += 1;
-            }
             return None;
         }
 
         for (input, target_file_size, target_level_files) in input_levels {
-            if min_write_amp_meet && input.total_file_size < target_file_size {
+            if (!target_level_files.is_empty() || input.sstable_infos.len() > 1)
+                && input.sstable_infos.len()
+                    < self.config.level0_sub_level_compact_level_count as usize
+                && input.total_file_size < target_file_size
+                && input.total_file_count < self.config.level0_max_compact_file_number as usize
+                && min_write_amp_meet
+            {
                 continue;
             }
 
