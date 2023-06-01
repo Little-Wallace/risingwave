@@ -124,6 +124,7 @@ impl LocalHummockStorage {
 
         self.hummock_version_reader
             .iter(table_key_range, epoch, read_options, read_snapshot)
+            .verbose_instrument_await("version_iter")
             .await
     }
 
