@@ -172,11 +172,6 @@ impl BlockCache {
             .map(BlockHolder::from_cached_block)
     }
 
-    pub fn exists_block(&self, sst_id: HummockSstableObjectId, block_idx: u64) -> bool {
-        self.inner
-            .contains(Self::hash(sst_id, block_idx), &(sst_id, block_idx))
-    }
-
     pub fn insert(
         &self,
         object_id: HummockSstableObjectId,
@@ -225,6 +220,11 @@ impl BlockCache {
             }
             LookupResponse::Miss(join_handle) => BlockResponse::Miss(join_handle),
         }
+    }
+
+    pub fn is_hot_block(&self, object_id: HummockSstableObjectId, block_idx: u64) -> bool {
+        let h = Self::hash(object_id, block_idx);
+        self.inner.is_hot_entry(h, &(object_id, block_idx))
     }
 
     fn hash(object_id: HummockSstableObjectId, block_idx: u64) -> u64 {
