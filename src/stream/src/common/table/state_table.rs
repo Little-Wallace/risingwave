@@ -117,7 +117,10 @@ pub struct StateTableInner<
     /// Strategy to buffer watermark for lazy state cleaning.
     watermark_buffer_strategy: W,
     /// State cleaning watermark. Old states will be cleaned under this watermark when committing.
-    state_clean_watermark: Option<ScalarImpl>,
+    state_clean_watermark: Option<Bytes>,
+
+    has_write_in_last_watermark: bool,
+    has_write_in_current_watermark: bool,
 }
 
 /// `StateTable` will use `BasicSerde` as default
@@ -253,6 +256,8 @@ where
             value_indices,
             watermark_buffer_strategy: W::default(),
             state_clean_watermark: None,
+            has_write_in_last_watermark: false,
+            has_write_in_current_watermark: false,
         }
     }
 
@@ -414,6 +419,8 @@ where
             value_indices,
             watermark_buffer_strategy: W::default(),
             state_clean_watermark: None,
+            has_write_in_last_watermark: false,
+            has_write_in_current_watermark: false,
         }
     }
 
@@ -652,7 +659,30 @@ where
     pub fn insert(&mut self, value: impl Row) {
         let pk = (&value).project(self.pk_indices());
 
-        let key_bytes = serialize_pk_with_vnode(pk, &self.pk_serde, self.compute_prefix_vnode(pk));
+        let vnode = self.compute_prefix_vnode(pk);
+        let key_bytes = serialize_pk_with_vnode(pk, &self.pk_serde, vnode);
+        if let Some(watermark) = self.state_clean_watermark.as_ref() && watermark.len() > 0 {
+            let first_byte = *watermark.first().unwrap();
+            let vnode_bytes = vnode.to_be_bytes();
+           if self.pk_serde.prefix(1).get_order_types().first().unwrap().is_ascending() {
+               let mut range_end = Vec::with_capacity(vnode_bytes.len() + watermark.len());
+               range_end.extend(vnode_bytes);
+               range_end.extend(watermark.as_ref());
+               if key_bytes.as_ref().ge(range_end.as_slice()) {
+                   self.has_write_in_current_watermark = true;
+               }
+           } else {
+               let following_bytes = next_key(&watermark[1..]);
+               if !following_bytes.is_empty() {
+                   let mut range_begin = vnode.to_be_bytes().to_vec();
+                   range_begin.push(first_byte);
+                   range_begin.extend(&following_bytes);
+                   if key_bytes.as_ref().lt(range_begin.as_slice()) {
+                       self.has_write_in_current_watermark = true;
+                   }
+               }
+           }
+        }
         let value_bytes = self.serialize_value(value);
         self.insert_inner(key_bytes, value_bytes);
     }
@@ -761,7 +791,13 @@ where
     pub fn update_watermark(&mut self, watermark: ScalarImpl, eager_cleaning: bool) {
         trace!(table_id = %self.table_id, watermark = ?watermark, "update watermark");
         if self.watermark_buffer_strategy.apply() || eager_cleaning {
-            self.state_clean_watermark = Some(watermark);
+            if !self.pk_indices().is_empty() {
+                let prefix_serializer = self.pk_serde.prefix(1);
+                let watermark_suffix = serialize_pk(row::once(Some(watermark)), &prefix_serializer);
+                self.state_clean_watermark = Some(watermark_suffix);
+                self.has_write_in_last_watermark = self.has_write_in_current_watermark;
+                self.has_write_in_current_watermark = false;
+            };
         }
     }
 
@@ -794,10 +830,13 @@ where
 
     /// Write to state store.
     async fn seal_current_epoch(&mut self, next_epoch: u64) -> StreamExecutorResult<()> {
-        let watermark = self.state_clean_watermark.take();
-        watermark.as_ref().inspect(|watermark| {
+        let mut watermark_suffix = self.state_clean_watermark.clone();
+        watermark_suffix.as_ref().inspect(|watermark| {
             trace!(table_id = %self.table_id, watermark = ?watermark, "state cleaning");
         });
+        if !self.has_write_in_last_watermark {
+            watermark = None;
+        }
 
         let mut delete_ranges = Vec::new();
 
@@ -806,16 +845,7 @@ where
         } else {
             Some(self.pk_serde.prefix(1))
         };
-        let watermark_suffix = watermark.map(|watermark| {
-            serialize_pk(
-                row::once(Some(watermark)),
-                prefix_serializer.as_ref().unwrap(),
-            )
-        });
         if let Some(watermark_suffix) = watermark_suffix && let Some(first_byte) = watermark_suffix.first() {
-            trace!(table_id = %self.table_id, watermark = ?watermark_suffix, vnodes = ?{
-                self.vnodes.iter_vnodes().collect_vec()
-            }, "delete range");
             if prefix_serializer.as_ref().unwrap().get_order_types().first().unwrap().is_ascending() {
                 // We either serialize null into `0u8`, data into `(1u8 || scalar)`, or serialize null
                 // into `1u8`, data into `(0u8 || scalar)`. We do not want to delete null
