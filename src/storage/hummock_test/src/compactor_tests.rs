@@ -14,46 +14,69 @@
 
 #[cfg(test)]
 pub(crate) mod tests {
-
-    use std::collections::{BTreeSet, HashMap};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     use std::ops::Bound;
-    use std::sync::atomic::AtomicU32;
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::sync::Arc;
 
     use bytes::{BufMut, Bytes, BytesMut};
     use itertools::Itertools;
-    use rand::Rng;
+    use rand::prelude::ThreadRng;
+    use rand::rngs::StdRng;
+    use rand::{Rng, RngCore, SeedableRng};
     use risingwave_common::cache::CachePriority;
     use risingwave_common::catalog::TableId;
     use risingwave_common::constants::hummock::CompactionFilterFlag;
+    use risingwave_common::hash::VirtualNode;
     use risingwave_common::util::epoch::Epoch;
     use risingwave_common_service::observer_manager::NotificationClient;
-    use risingwave_hummock_sdk::compaction_group::hummock_version_ext::HummockVersionExt;
+    use risingwave_hummock_sdk::compaction_group::hummock_version_ext::{
+        GroupDeltasSummary, HummockLevelsExt, HummockVersionExt,
+    };
     use risingwave_hummock_sdk::compaction_group::StaticCompactionGroupId;
-    use risingwave_hummock_sdk::key::{next_key, TABLE_PREFIX_LEN};
+    use risingwave_hummock_sdk::key::{next_key, FullKey, TableKey, TABLE_PREFIX_LEN};
+    use risingwave_hummock_sdk::key_range::KeyRange;
     use risingwave_hummock_sdk::table_stats::to_prost_table_stats_map;
+    use risingwave_hummock_sdk::HummockCompactionTaskId;
     use risingwave_meta::hummock::compaction::compaction_config::CompactionConfigBuilder;
-    use risingwave_meta::hummock::compaction::{default_level_selector, ManualCompactionOption};
+    use risingwave_meta::hummock::compaction::{
+        default_level_selector, CompactStatus, LevelSelector, LocalSelectorStatistic,
+        ManualCompactionOption,
+    };
+    use risingwave_meta::hummock::model::CompactionGroup;
     use risingwave_meta::hummock::test_utils::{
         register_table_ids_to_compaction_group, setup_compute_env, setup_compute_env_with_config,
         unregister_table_ids_from_compaction_group,
     };
-    use risingwave_meta::hummock::{HummockManagerRef, MockHummockMetaClient};
+    use risingwave_meta::hummock::{HummockManagerRef, LevelHandler, MockHummockMetaClient};
     use risingwave_meta::storage::MetaStore;
     use risingwave_pb::common::{HostAddress, WorkerType};
-    use risingwave_pb::hummock::{HummockVersion, TableOption};
+    use risingwave_pb::hummock::compact_task::TaskStatus;
+    use risingwave_pb::hummock::hummock_version::Levels;
+    use risingwave_pb::hummock::{
+        CompactTask, HummockVersion, Level, LevelType, OverlappingLevel, SstableInfo, TableOption,
+    };
     use risingwave_pb::meta::add_worker_node_request::Property;
     use risingwave_rpc_client::HummockMetaClient;
     use risingwave_storage::filter_key_extractor::{
         FilterKeyExtractorImpl, FilterKeyExtractorManagerRef, FixedLengthFilterKeyExtractor,
         FullKeyFilterKeyExtractor,
     };
-    use risingwave_storage::hummock::compactor::{CompactionExecutor, Compactor, CompactorContext};
+    use risingwave_storage::hummock::compactor::{
+        CompactionExecutor, Compactor, CompactorContext, ConcatSstableIterator,
+        DummyCompactionFilter, TaskConfig, TaskProgress,
+    };
     use risingwave_storage::hummock::iterator::test_utils::mock_sstable_store;
+    use risingwave_storage::hummock::iterator::UnorderedMergeIteratorInner;
+    use risingwave_storage::hummock::multi_builder::{
+        CapacitySplitTableBuilder, LocalTableBuilderFactory,
+    };
     use risingwave_storage::hummock::sstable_store::SstableStoreRef;
+    use risingwave_storage::hummock::value::HummockValue;
     use risingwave_storage::hummock::{
-        CachePolicy, HummockStorage as GlobalHummockStorage, HummockStorage, MemoryLimiter,
-        SstableObjectIdManager,
+        BlockedXor16FilterBuilder, CachePolicy, CompactionDeleteRanges,
+        HummockStorage as GlobalHummockStorage, HummockStorage, MemoryLimiter, SstableBuilder,
+        SstableBuilderOptions, SstableObjectIdManager, SstableWriterOptions,
     };
     use risingwave_storage::monitor::{CompactorMetrics, StoreLocalStatistic};
     use risingwave_storage::opts::StorageOpts;
@@ -1258,5 +1281,344 @@ pub(crate) mod tests {
             .unwrap();
         assert_eq!(1, output_level_info.table_infos.len());
         assert_eq!(252, output_level_info.table_infos[0].total_key_count);
+    }
+
+    #[async_trait::async_trait]
+    pub trait SstableInfoGenerator {
+        async fn generate(
+            &mut self,
+            sst_id: u64,
+            kv_count: usize,
+            epoch: u64,
+            sstable_store: &SstableStoreRef,
+        ) -> SstableInfo;
+    }
+
+    fn apply_compaction_task(levels: &mut Levels, compact_task: CompactTask) {
+        let mut delete_sst_levels = compact_task
+            .input_ssts
+            .iter()
+            .map(|level| level.level_idx)
+            .collect_vec();
+        if delete_sst_levels.len() > 1 {
+            delete_sst_levels.sort();
+            delete_sst_levels.dedup();
+        }
+        let delete_sst_ids_set: HashSet<u64> = compact_task
+            .input_ssts
+            .iter()
+            .flat_map(|level| level.table_infos.iter())
+            .map(|sst| sst.sst_id)
+            .collect();
+        levels.apply_compact_ssts(GroupDeltasSummary {
+            delete_sst_levels,
+            delete_sst_ids_set,
+            insert_sst_level_id: compact_task.target_level,
+            insert_sub_level_id: compact_task.target_sub_level_id,
+            insert_table_infos: compact_task.sorted_output_ssts,
+            group_construct: None,
+            group_destroy: None,
+            group_meta_changes: vec![],
+            group_table_change: None,
+        });
+    }
+
+    pub struct CompactTest {
+        throughput_multiplier: u64,
+        group: Levels,
+        group_config: CompactionGroup,
+        selector: Box<dyn LevelSelector>,
+        sstable_store: SstableStoreRef,
+        handlers: Vec<LevelHandler>,
+        global_task_id: HummockCompactionTaskId,
+        pending_tasks: BTreeMap<u64, (CompactTask, u64, u64)>,
+        stats: LocalSelectorStatistic,
+        global_sst_id: Arc<AtomicU64>,
+        rng: ThreadRng,
+    }
+
+    impl CompactTest {
+        pub fn new(throughput_multiplier: u64) -> Self {
+            let mut group = Levels {
+                levels: vec![],
+                l0: Some(OverlappingLevel::default()),
+                group_id: 1,
+                parent_group_id: 0,
+                member_table_ids: vec![1, 2],
+            };
+            let mut handlers = vec![LevelHandler::new(0)];
+            for idx in 1..7 {
+                group.levels.push(Level {
+                    level_idx: idx,
+                    level_type: 0,
+                    table_infos: vec![],
+                    total_file_size: 0,
+                    sub_level_id: 0,
+                    uncompressed_file_size: 0,
+                });
+                handlers.push(LevelHandler::new(idx));
+            }
+            Self {
+                group_config: CompactionGroup::new(1, CompactionConfigBuilder::new().build()),
+                selector: default_level_selector(),
+                sstable_store: mock_sstable_store(),
+                handlers,
+                pending_tasks: BTreeMap::default(),
+                global_task_id: 1,
+                group,
+                global_sst_id: Arc::new(AtomicU64::new(1)),
+                stats: LocalSelectorStatistic::default(),
+                rng: rand::thread_rng(),
+                throughput_multiplier,
+            }
+        }
+
+        fn pick_one_task(&mut self, start_time: u64) -> bool {
+            if let Some(task) = self.selector.pick_compaction(
+                self.global_task_id,
+                &self.group_config,
+                &self.group,
+                &mut self.handlers,
+                &mut self.stats,
+                HashMap::default(),
+            ) {
+                let mut task: CompactTask = task.into();
+                if CompactStatus::is_trivial_move_task(&task) {
+                    task.sorted_output_ssts = task.input_ssts[0].table_infos.clone();
+                    task.set_task_status(TaskStatus::Success);
+                    for level in &task.input_ssts {
+                        self.handlers[level.level_idx as usize].remove_task(task.task_id);
+                    }
+                    apply_compaction_task(&mut self.group, task);
+                } else {
+                    let task_size = task
+                        .input_ssts
+                        .iter()
+                        .flat_map(|level| level.table_infos.iter())
+                        .map(|sst| sst.file_size)
+                        .sum::<u64>();
+                    let compact_speed = 32 * 1024 * 1024;
+                    self.pending_tasks.insert(
+                        self.global_task_id,
+                        (
+                            task,
+                            start_time,
+                            self.rng.next_u64() % 3 + 1 + task_size / compact_speed,
+                        ),
+                    );
+                }
+                self.global_task_id += 1;
+                return true;
+            }
+            false
+        }
+
+        async fn test_random_compact_impl<S: SstableInfoGenerator>(&mut self, mut generator: S) {
+            const CHECKPOINT_TIMES: u64 = 10;
+            const TEST_TIMES: u64 = 100000;
+            const KV_COUNT: usize = 16;
+            const MAX_COMPACT_TASK_COUNT: usize = 16;
+            let mut rng = rand::thread_rng();
+            let mut finished_task = vec![];
+            for i in 1..TEST_TIMES {
+                if i % CHECKPOINT_TIMES == 0 {
+                    let mut sst_info = generator
+                        .generate(
+                            self.global_sst_id.fetch_add(1, Ordering::Relaxed),
+                            rng.next_u64() as usize % KV_COUNT + 1,
+                            i,
+                            &self.sstable_store,
+                        )
+                        .await;
+                    sst_info.uncompressed_file_size *= self.throughput_multiplier;
+                    sst_info.file_size *= self.throughput_multiplier;
+                    self.group.l0.as_mut().unwrap().sub_levels.push(Level {
+                        level_idx: 0,
+                        level_type: LevelType::Overlapping as i32,
+                        total_file_size: sst_info.file_size,
+                        uncompressed_file_size: sst_info.uncompressed_file_size,
+                        table_infos: vec![sst_info],
+                        sub_level_id: 0,
+                    });
+                    if self.pending_tasks.len() < MAX_COMPACT_TASK_COUNT {
+                        self.pick_one_task(i);
+                    }
+                }
+                for (task_id, (_, start_time, cost_time)) in &self.pending_tasks {
+                    if start_time + cost_time <= i {
+                        finished_task.push(*task_id);
+                    }
+                }
+
+                if !finished_task.is_empty() {
+                    for task_id in finished_task.drain(..) {
+                        let (mut task, _, _) = self.pending_tasks.remove(&task_id).unwrap();
+                        self.finish_compaction_task(&mut task).await;
+                        apply_compaction_task(&mut self.group, task);
+                    }
+                    while self.pending_tasks.len() < MAX_COMPACT_TASK_COUNT {
+                        if !self.pick_one_task(i) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        async fn finish_compaction_task(&mut self, task: &mut CompactTask) {
+            let task_progress = Arc::new(TaskProgress::default());
+            let mut table_iters = vec![];
+            for level in &task.input_ssts {
+                // Do not need to filter the table because manager has done it.
+                if level.level_type == LevelType::Nonoverlapping as i32 {
+                    table_iters.push(ConcatSstableIterator::new(
+                        vec![1],
+                        level.table_infos.clone(),
+                        KeyRange::inf(),
+                        self.sstable_store.clone(),
+                        task_progress.clone(),
+                        0,
+                    ));
+                } else {
+                    for table_info in &level.table_infos {
+                        table_iters.push(ConcatSstableIterator::new(
+                            vec![1],
+                            vec![table_info.clone()],
+                            KeyRange::inf(),
+                            self.sstable_store.clone(),
+                            task_progress.clone(),
+                            0,
+                        ));
+                    }
+                }
+            }
+            let opts = SstableBuilderOptions {
+                capacity: (task.target_file_size / self.throughput_multiplier) as usize,
+                block_capacity: 1024,
+                ..Default::default()
+            };
+            let builder_factory = LocalTableBuilderFactory::with_sst_id(
+                self.global_sst_id.clone(),
+                self.sstable_store.clone(),
+                opts,
+            );
+            let is_target_l0_or_lbase =
+                task.target_level == 0 || task.target_level == task.base_level;
+
+            let mut sst_builder = CapacitySplitTableBuilder::new(
+                builder_factory,
+                None,
+                is_target_l0_or_lbase,
+                task.split_by_state_table,
+                task.split_weight_by_vnode,
+            );
+            let iter = UnorderedMergeIteratorInner::for_compactor(table_iters);
+            Compactor::compact_and_build_sst(
+                &mut sst_builder,
+                Arc::new(CompactionDeleteRanges::default()),
+                &TaskConfig {
+                    key_range: KeyRange::inf(),
+                    gc_delete_keys: false,
+                    watermark: task.watermark,
+                    is_target_l0_or_lbase,
+                    use_block_based_filter: true,
+                    ..Default::default()
+                },
+                Arc::new(CompactorMetrics::unused()),
+                iter,
+                DummyCompactionFilter,
+                None,
+            )
+            .await
+            .unwrap();
+            let ret = sst_builder.finish().await.unwrap();
+            let mut ssts = Vec::with_capacity(ret.len());
+            for mut output in ret {
+                output.writer_output.await.unwrap().unwrap();
+                output.sst_info.sst_info.file_size *= self.throughput_multiplier;
+                output.sst_info.sst_info.uncompressed_file_size *= self.throughput_multiplier;
+                ssts.push(output.sst_info.sst_info);
+            }
+            for level in &task.input_ssts {
+                self.handlers[level.level_idx as usize].remove_task(task.task_id);
+            }
+            task.sorted_output_ssts = ssts;
+            task.set_task_status(TaskStatus::Success);
+        }
+    }
+
+    pub struct RandomGenerator {
+        max_pk: u64,
+        rng: StdRng,
+    }
+
+    pub fn test_table_key_of(idx: u64, vnode: usize) -> TableKey<Vec<u8>> {
+        let mut key = VirtualNode::from_index(vnode).to_be_bytes().to_vec();
+        key.extend_from_slice(idx.to_be_bytes().as_slice());
+        TableKey(key)
+    }
+
+    #[async_trait::async_trait]
+    impl SstableInfoGenerator for RandomGenerator {
+        async fn generate(
+            &mut self,
+            sst_id: u64,
+            kv_count: usize,
+            epoch: u64,
+            sstable_store: &SstableStoreRef,
+        ) -> SstableInfo {
+            let writer_opts = SstableWriterOptions {
+                capacity_hint: None,
+                tracker: None,
+                policy: CachePolicy::Disable,
+            };
+            let opts = SstableBuilderOptions {
+                capacity: 1024,
+                block_capacity: 256,
+                ..Default::default()
+            };
+            let writer = sstable_store.clone().create_sst_writer(sst_id, writer_opts);
+            let mut b = SstableBuilder::<_, BlockedXor16FilterBuilder>::new(
+                sst_id,
+                writer,
+                BlockedXor16FilterBuilder::new(512),
+                opts,
+                Arc::new(FilterKeyExtractorImpl::FullKey(FullKeyFilterKeyExtractor)),
+                None,
+            );
+            let v = epoch.to_be_bytes().to_vec();
+            for vnode_idx in 0..VirtualNode::COUNT / 16 {
+                let vnode = vnode_idx * 16;
+                for _ in 0..kv_count {
+                    let k = self.rng.next_u64() % self.max_pk + 1;
+                    b.add(
+                        FullKey::new(TableId::new(1), test_table_key_of(k, vnode), epoch).to_ref(),
+                        HummockValue::Put(v.as_slice()),
+                        true,
+                    )
+                    .await
+                    .unwrap();
+                }
+            }
+            let output = b.finish().await.unwrap();
+            output.writer_output.await.unwrap().unwrap();
+            output.sst_info.sst_info
+        }
+    }
+
+    #[tokio::test]
+    async fn test_random_compact() {
+        let mut test = CompactTest::new(512 * 1024);
+        test.test_random_compact_impl(RandomGenerator {
+            max_pk: 1000000,
+            rng: StdRng::seed_from_u64(0),
+        })
+        .await;
+        let mut test = CompactTest::new(1024);
+        test.test_random_compact_impl(RandomGenerator {
+            max_pk: 1000000,
+            rng: StdRng::seed_from_u64(0),
+        })
+        .await;
     }
 }
