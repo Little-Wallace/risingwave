@@ -22,6 +22,7 @@ use risingwave_pb::hummock::{CompactionConfig, InputLevel, LevelType, Overlappin
 use super::{CompactionInput, CompactionPicker, LocalPickerStatistic};
 use crate::hummock::compaction::picker::min_overlap_compaction_picker::MAX_LEVEL_COUNT;
 use crate::hummock::compaction::picker::partition_level;
+use crate::hummock::compaction::SubLevelPartition;
 use crate::hummock::level_handler::LevelHandler;
 
 pub struct TierCompactionPicker {
@@ -68,12 +69,14 @@ impl TierCompactionPicker {
             });
 
             if can_concat(&input_level.table_infos) {
+                let mut partitions =
+                    vec![SubLevelPartition::default(); vnode_partition_count as usize];
                 if vnode_partition_count > 0
                     && !partition_level(
                         table_id,
                         vnode_partition_count as usize,
                         level,
-                        &mut Vec::default(),
+                        &mut partitions,
                     )
                 {
                     vnode_partition_count = 0;

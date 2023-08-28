@@ -196,11 +196,22 @@ impl CompactionPicker for IntraSubLevelPicker {
                 {
                     continue;
                 }
+
+                println!(
+                    "partition: {}, {}",
+                    levels.vnode_partition_count,
+                    input_levels.len()
+                );
+                let vnode_partition_count = if compaction_bytes > max_compaction_bytes {
+                    levels.vnode_partition_count
+                } else {
+                    0
+                };
                 return Some(CompactionInput {
                     input_levels,
                     target_level: 0,
                     target_sub_level_id: l0.sub_levels[idx].sub_level_id,
-                    vnode_partition_count: l0.sub_levels[idx].vnode_partition_count,
+                    vnode_partition_count,
                 });
             }
         }

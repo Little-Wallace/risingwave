@@ -410,6 +410,7 @@ impl LevelSelector for DynamicLevelSelector {
             if let Some(ret) = picker.pick_compaction(levels, level_handlers, &mut stats) {
                 ret.add_pending_task(task_id, level_handlers);
                 return Some(create_compaction_task(
+                    task_id,
                     dynamic_level_core.get_config(),
                     ret,
                     ctx.base_level,
@@ -473,6 +474,7 @@ impl LevelSelector for ManualCompactionSelector {
         compaction_input.add_pending_task(task_id, level_handlers);
 
         Some(create_compaction_task(
+            task_id,
             group.compaction_config.as_ref(),
             compaction_input,
             base_level,
@@ -524,6 +526,7 @@ impl LevelSelector for SpaceReclaimCompactionSelector {
         compaction_input.add_pending_task(task_id, level_handlers);
 
         Some(create_compaction_task(
+            task_id,
             dynamic_level_core.get_config(),
             compaction_input,
             base_level,
@@ -573,6 +576,7 @@ impl LevelSelector for TtlCompactionSelector {
         compaction_input.add_pending_task(task_id, level_handlers);
 
         Some(create_compaction_task(
+            task_id,
             group.compaction_config.as_ref(),
             compaction_input,
             base_level,
