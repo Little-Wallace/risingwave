@@ -72,7 +72,7 @@ impl CompactionPicker for IntraSubLevelPicker {
 
         for (idx, level) in l0.sub_levels.iter().enumerate() {
             if level.level_type() != LevelType::Nonoverlapping
-                || level_handlers[0].is_level_all_pending_compact(level)
+                || level_handlers[0].is_level_pending_compact(level)
             {
                 continue;
             }
@@ -115,6 +115,7 @@ impl CompactionPicker for IntraSubLevelPicker {
 
                 compaction_bytes += next_level.total_file_size;
                 compaction_file_count += next_level.table_infos.len() as u64;
+
                 input_levels.push(InputLevel {
                     level_idx: 0,
                     level_type: next_level.level_type,
