@@ -73,6 +73,7 @@ pub struct SelectContext {
     // level, which equals to `base_level -= 1;`.
     pub base_level: usize,
     pub score_levels: Vec<(u64, usize, usize)>,
+    pub target_partitions: Vec<SubLevelPartition>,
 }
 
 pub struct DynamicLevelSelectorCore {
@@ -131,7 +132,20 @@ impl DynamicLevelSelectorCore {
         for level in &levels.levels {
             if level.total_file_size > 0 && first_non_empty_level == 0 {
                 first_non_empty_level = level.level_idx as usize;
-                first_level_partition_count = level.vnode_partition_count;
+                if level.vnode_partition_count > 0 {
+                    first_level_partition_count = level.vnode_partition_count;
+                    ctx.target_partitions =
+                        vec![SubLevelPartition::default(); first_level_partition_count as usize];
+                    if !partition_level(
+                        levels.member_table_ids[0],
+                        first_level_partition_count as usize,
+                        level,
+                        &mut ctx.target_partitions,
+                    ) {
+                        ctx.target_partitions.clear();
+                        first_level_partition_count = 0;
+                    }
+                }
             }
             max_level_size = std::cmp::max(max_level_size, level.total_file_size);
         }
@@ -146,7 +160,7 @@ impl DynamicLevelSelectorCore {
         }
 
         let mut max_bytes_for_level_base = self.config.max_bytes_for_level_base;
-        if first_level_partition_count != 0 {
+        if first_level_partition_count > 0 {
             max_bytes_for_level_base *= first_level_partition_count as u64;
         }
 
@@ -274,19 +288,13 @@ impl DynamicLevelSelectorCore {
                 continue;
             }
             let mut score = total_size * SCORE_BASE / ctx.level_max_bytes[level_idx];
-            let vnode_partition_count = level.vnode_partition_count as usize;
             if level.level_idx as usize == ctx.base_level
                 && level.vnode_partition_count != 0
                 && levels.member_table_ids.len() == 1
+                && !ctx.target_partitions.is_empty()
             {
-                let mut partitions = vec![SubLevelPartition::default(); vnode_partition_count];
-                assert!(partition_level(
-                    levels.member_table_ids[0],
-                    vnode_partition_count,
-                    level,
-                    &mut partitions
-                ));
-                let max_size = partitions
+                let max_size = ctx
+                    .target_partitions
                     .iter()
                     .map(|part| part.sub_levels[0].total_file_size)
                     .max()

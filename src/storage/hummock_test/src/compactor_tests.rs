@@ -1335,6 +1335,8 @@ pub(crate) mod tests {
         ));
     }
 
+    const PARTITION_COUNT: usize = 8;
+
     pub trait SstableInfoGenerator {
         fn generate(&mut self, kv_count: usize) -> Vec<TableKey<Vec<u8>>>;
     }
@@ -1363,7 +1365,7 @@ pub(crate) mod tests {
                 group_id: 1,
                 parent_group_id: 0,
                 member_table_ids: vec![1],
-                vnode_partition_count: 8,
+                vnode_partition_count: PARTITION_COUNT as u32,
             };
             let mut handlers = vec![LevelHandler::new(0)];
             for idx in 1..7 {
@@ -1493,6 +1495,7 @@ pub(crate) mod tests {
             ) {
                 self.selector_time += t.elapsed().as_millis() as u64;
                 let mut task: CompactTask = task.into();
+                task.existing_table_ids = vec![1];
                 task.watermark = checkpoint;
                 if CompactStatus::is_trivial_move_task(&task) {
                     task.sorted_output_ssts = task.input_ssts[0].table_infos.clone();
@@ -1600,11 +1603,12 @@ pub(crate) mod tests {
             .unwrap();
             let ret = sst_builder.finish().await.unwrap();
             let mut ssts = Vec::with_capacity(ret.len());
-            for mut output in ret {
+            for output in ret {
                 output.writer_output.await.unwrap().unwrap();
-                output.sst_info.sst_info.file_size *= self.throughput_multiplier;
-                output.sst_info.sst_info.uncompressed_file_size *= self.throughput_multiplier;
-                ssts.push(output.sst_info.sst_info);
+                let mut sst_info = output.sst_info.sst_info;
+                sst_info.file_size *= self.throughput_multiplier;
+                sst_info.uncompressed_file_size *= self.throughput_multiplier;
+                ssts.push(sst_info);
             }
             for level in &task.input_ssts {
                 self.handlers[level.level_idx as usize].remove_task(task.task_id);
@@ -1684,8 +1688,8 @@ pub(crate) mod tests {
     impl SstableInfoGenerator for RandomGenerator {
         fn generate(&mut self, kv_count: usize) -> Vec<TableKey<Vec<u8>>> {
             let mut data = Vec::with_capacity(VirtualNode::COUNT / 16 * kv_count);
-            for vnode_idx in 0..VirtualNode::COUNT / 16 {
-                let vnode = vnode_idx * 16;
+            for vnode_idx in 0..VirtualNode::COUNT / PARTITION_COUNT {
+                let vnode = vnode_idx * PARTITION_COUNT;
                 for _ in 0..kv_count {
                     let k = self.rng.next_u64() % self.max_pk + 1;
                     data.push(test_table_key_of(k, vnode));

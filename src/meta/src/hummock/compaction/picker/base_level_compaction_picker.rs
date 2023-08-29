@@ -73,6 +73,7 @@ impl CompactionPicker for LevelCompactionPicker {
         } else {
             vec![]
         };
+
         if let Some(ret) =
             self.pick_multi_level_to_base(levels, level_handlers, partitions.clone(), stats)
         {

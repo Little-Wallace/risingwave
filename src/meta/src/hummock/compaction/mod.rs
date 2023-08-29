@@ -38,8 +38,10 @@ pub use crate::hummock::compaction::level_selector::{
     ManualCompactionSelector, SpaceReclaimCompactionSelector, TtlCompactionSelector,
 };
 use crate::hummock::compaction::overlap_strategy::{OverlapStrategy, RangeOverlapStrategy};
+use crate::hummock::compaction::picker::{
+    can_partition_level, CompactionInput, LocalPickerStatistic,
+};
 pub use crate::hummock::compaction::picker::{partition_level, SubLevelPartition};
-use crate::hummock::compaction::picker::{CompactionInput, LocalPickerStatistic};
 use crate::hummock::level_handler::LevelHandler;
 use crate::hummock::model::CompactionGroup;
 use crate::rpc::metrics::MetaMetrics;
@@ -169,6 +171,16 @@ impl CompactStatus {
     }
 
     pub fn is_trivial_move_task(task: &CompactTask) -> bool {
+        if task.split_weight_by_vnode > 0
+            && task.target_level == 0
+            && !can_partition_level(
+                task.existing_table_ids[0],
+                task.split_weight_by_vnode as usize,
+                &task.input_ssts[0].table_infos,
+            )
+        {
+            return false;
+        }
         if task.input_ssts.len() == 1 {
             return task.input_ssts[0].level_idx == 0
                 && can_concat(&task.input_ssts[0].table_infos);
