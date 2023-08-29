@@ -1756,7 +1756,7 @@ pub(crate) mod tests {
 
     #[tokio::test]
     async fn test_random_compact_small_throughput() {
-        let mut test = CompactTest::new(1024, 1000);
+        let mut test = CompactTest::new(1024, 1500);
         test.test_selector_compact_impl(RandomGenerator {
             max_pk: 1000000,
             rng: StdRng::seed_from_u64(0),

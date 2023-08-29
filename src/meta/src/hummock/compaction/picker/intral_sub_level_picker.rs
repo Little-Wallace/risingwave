@@ -198,10 +198,7 @@ impl CompactionPicker for IntraSubLevelPicker {
                     }
                 }
 
-                if !wait_enough
-                    && input_levels.len()
-                        < self.config.level0_sub_level_compact_level_count as usize
-                {
+                if input_levels.len() < self.config.level0_sub_level_compact_level_count as usize {
                     continue;
                 }
 
