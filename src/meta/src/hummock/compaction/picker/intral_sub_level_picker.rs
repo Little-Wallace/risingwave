@@ -161,12 +161,10 @@ impl CompactionPicker for IntraSubLevelPicker {
                 let mut compaction_bytes = 0;
                 let mut compaction_file_count = 0;
                 let mut input_levels = vec![];
-                let mut wait_enough = false;
                 for right in idx..part.sub_levels.len() {
                     if compaction_file_count > self.config.level0_max_compact_file_number
                         || compaction_bytes > max_compaction_bytes
                     {
-                        wait_enough = true;
                         break;
                     }
                     let mut pending_compact = false;
@@ -215,6 +213,10 @@ impl CompactionPicker for IntraSubLevelPicker {
 }
 
 pub fn partition_sub_levels(levels: &Levels) -> Vec<SubLevelPartition> {
+    if levels.member_table_ids.len() != 1 || levels.vnode_partition_count == 0 {
+        return vec![];
+    }
+
     let mut partition_vnode_count: usize = 1;
     while partition_vnode_count * 2 <= (levels.vnode_partition_count as usize) {
         partition_vnode_count *= 2;

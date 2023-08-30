@@ -68,7 +68,8 @@ impl CompactionPicker for LevelCompactionPicker {
         }
 
         debug_assert!(self.target_level == levels.get_level(self.target_level).level_idx as usize);
-        let partitions = if levels.vnode_partition_count != 0 {
+        let partitions = if levels.vnode_partition_count != 0 && levels.member_table_ids.len() == 1
+        {
             partition_sub_levels(levels)
         } else {
             vec![]

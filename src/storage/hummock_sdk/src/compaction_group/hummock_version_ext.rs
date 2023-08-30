@@ -706,6 +706,18 @@ impl HummockLevelsExt for Levels {
                 level_insert_ssts(&mut l0.sub_levels[index], insert_table_infos);
             } else {
                 let idx = insert_sst_level_id as usize - 1;
+                if self.levels[idx].table_infos.is_empty()
+                    && insert_table_infos
+                        .iter()
+                        .all(|sst| sst.table_ids.len() == 1)
+                {
+                    self.levels[idx].vnode_partition_count = new_partition_vnode_count;
+                } else if self.levels[idx].vnode_partition_count != 0
+                    && new_partition_vnode_count == 0
+                    && self.levels.len() > 1
+                {
+                    self.levels[idx].vnode_partition_count = 0;
+                }
                 level_insert_ssts(&mut self.levels[idx], insert_table_infos);
             }
         }
